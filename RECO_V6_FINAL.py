@@ -49,11 +49,11 @@ class ProGauge(QWidget):
         size = min(w, h) - 20
         rect = QRectF((w-size)/2, (h-size)/2, size, size)
         
-        # רקע
+        # Draw background arc
         p.setPen(QPen(QColor("#2d303e"), 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         p.drawArc(rect, 135*16, 270*16)
         
-        # ערך
+        # Draw value arc
         ratio = self.value / self.max_val
         angle = int(270 * ratio)
         if angle > 270: angle = 270
@@ -62,7 +62,7 @@ class ProGauge(QWidget):
         p.setPen(QPen(col, 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         p.drawArc(rect, 225*16, -angle*16)
         
-        # טקסט
+        # Draw Text
         p.setPen(QColor("white"))
         p.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
         p.drawText(rect, Qt.AlignmentFlag.AlignCenter, f"{self.value:.1f}{self.unit}")
@@ -91,20 +91,20 @@ class StreamWorker(QObject):
             api = f"{base}/api.php"
             auth = f"username={c['user']}&password={c['pass']}"
             
-            # בדיקת קטגוריה
+            # Check Category
             try:
                 res = requests.get(f"{api}?action=get_categories&{auth}", timeout=5).json()
                 cat = next((x['category_id'] for x in res if x['category_name']=="Channels"), None)
             except: cat = None
             
-            # יצירה אם לא קיים
+            # Create if missing
             if not cat:
                 try:
                     res = requests.post(f"{api}?action=add_category", data={**c, "category_name":"Channels", "category_type":"live"}).json()
                     cat = res.get('category_id', "1")
                 except: cat = "1"
             
-            # יצירת סטרים
+            # Add Stream
             requests.post(f"{api}?action=add_stream", data={
                 "username": c['user'], "password": c['pass'],
                 "stream_display_name": self.name, "stream_source": ["127.0.0.1"],
@@ -127,7 +127,6 @@ class StreamWorker(QObject):
         except: pass
         
         while self.running:
-            # פקודת FFmpeg יציבה
             cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-stimeout', '5000000', '-i', self.url, '-c', 'copy', '-f', 'mpegts']
             tgts = []
             
@@ -162,7 +161,7 @@ class StreamWorker(QObject):
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL MANAGER v12.0 (Production)")
+        self.setWindowTitle("X-HOTEL MANAGER v12.1 (Fixed)")
         self.resize(1600, 1000)
         self.workers = {}
         self.net_io = psutil.net_io_counters()
@@ -199,7 +198,7 @@ class XHotelUI(QMainWindow):
         tabs = QTabWidget()
         l.addWidget(tabs)
 
-        # Tab 1: Live
+        # Tab 1: Live Operations
         t1 = QWidget()
         t1l = QVBoxLayout(t1)
         c_f = QFrame()
@@ -229,7 +228,9 @@ class XHotelUI(QMainWindow):
         
         self.tbl = QTableWidget(0, 7)
         self.tbl.setHorizontalHeaderLabels(["SEL", "CHANNEL", "REC", "STATUS", "UPTIME", "DISK", "ACTION"])
-        self.tbl.horizontalHeader().setSectionResizeMode(1)
+        # --- THE FIX IS HERE ---
+        self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch) 
+        # -----------------------
         t1l.addWidget(self.tbl)
         
         acts = QHBoxLayout()
