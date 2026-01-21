@@ -1,4 +1,12 @@
-import sys, subprocess, threading, time, os, re, requests, psutil, json
+import sys
+import subprocess
+import threading
+import time
+import os
+import requests
+import psutil
+import json
+import urllib3
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLineEdit, QPushButton, QTableWidget,
@@ -7,27 +15,42 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import pyqtSignal, QObject, Qt, QTimer, QRectF
 from PyQt6.QtGui import QPainter, QColor, QPen, QFont
 
-# --- הגדרות מערכת ---
+# --- הגדרות ---
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["QT_QUICK_BACKEND"] = "software"
+
+# --- עדכן כאן את הפרטים שלך ---
 TELEGRAM_TOKEN = "8307008722:AAHY-QYNYyTnOwjS0q4VGfA0_iUiQBxYHBc"
 TELEGRAM_CHAT_ID = "-5125327073"
+
 CONFIG_FILE = "/root/iptv_config.json"
 RECORDINGS_PATH = "/root/Recordings"
 
-# --- רכיב UX: כפתור כלי עבודה ---
+# --- פונקציית טלגרם גלובלית ---
+def send_telegram(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, verify=False, timeout=5)
+    except:
+        pass
+
+# --- רכיבים גרפיים ---
 class ToolButton(QPushButton):
     def __init__(self, text, icon, color="#2d303e"):
         super().__init__()
         self.setText(f"{icon}  {text}")
         self.setStyleSheet(f"""
             QPushButton {{
-                background-color: {color}; color: white; border-radius: 10px;
-                padding: 15px; font-size: 14px; font-weight: bold; border: 1px solid #3b3f51;
+                background-color: {color};
+                color: white;
+                border-radius: 10px;
+                padding: 15px;
+                font-weight: bold;
+                border: 1px solid #3b3f51;
             }}
             QPushButton:hover {{ background-color: #40e0d0; color: #000; }}
         """)
 
-# --- רכיב UX: שעון אנליטי ---
 class ProGauge(QWidget):
     def __init__(self, title, unit, max_val=100, color="#00d4ff"):
         super().__init__()
@@ -49,29 +72,27 @@ class ProGauge(QWidget):
         size = min(w, h) - 20
         rect = QRectF((w-size)/2, (h-size)/2, size, size)
         
-        # Draw background arc
+        # רקע
         p.setPen(QPen(QColor("#2d303e"), 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         p.drawArc(rect, 135*16, 270*16)
         
-        # Draw value arc
+        # ערך
         ratio = self.value / self.max_val
         angle = int(270 * ratio)
         if angle > 270: angle = 270
-        
         col = self.primary_color if ratio < 0.85 else QColor("#ff2e63")
         p.setPen(QPen(col, 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         p.drawArc(rect, 225*16, -angle*16)
         
-        # Draw Text
+        # טקסט
         p.setPen(QColor("white"))
         p.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
         p.drawText(rect, Qt.AlignmentFlag.AlignCenter, f"{self.value:.1f}{self.unit}")
-        
         p.setPen(QColor("#a6accd"))
         p.setFont(QFont("Segoe UI", 10))
         p.drawText(int(w/2)-50, int(h)-30, 100, 20, Qt.AlignmentFlag.AlignCenter, self.title)
 
-# --- לוגיקת שרת ---
+# --- לוגיקת שידור (Worker) ---
 class StreamWorker(QObject):
     stats_signal = pyqtSignal(str, dict)
     
@@ -91,25 +112,31 @@ class StreamWorker(QObject):
             api = f"{base}/api.php"
             auth = f"username={c['user']}&password={c['pass']}"
             
-            # Check Category
+            # בדיקת קטגוריה
             try:
-                res = requests.get(f"{api}?action=get_categories&{auth}", timeout=5).json()
+                res = requests.get(f"{api}?action=get_categories&{auth}", timeout=5, verify=False).json()
                 cat = next((x['category_id'] for x in res if x['category_name']=="Channels"), None)
-            except: cat = None
+            except:
+                cat = None
             
-            # Create if missing
-            if not cat:
+            # יצירה אם חסר
+            if not cat: 
                 try:
-                    res = requests.post(f"{api}?action=add_category", data={**c, "category_name":"Channels", "category_type":"live"}).json()
+                    res = requests.post(f"{api}?action=add_category", data={**c,"category_name":"Channels","category_type":"live"}, verify=False).json()
                     cat = res.get('category_id', "1")
-                except: cat = "1"
+                except:
+                    cat = "1"
             
-            # Add Stream
+            # יצירת סטרים
             requests.post(f"{api}?action=add_stream", data={
-                "username": c['user'], "password": c['pass'],
-                "stream_display_name": self.name, "stream_source": ["127.0.0.1"],
-                "category_id": cat, "stream_mode": "live"
-            })
+                "username": c['user'],
+                "password": c['pass'],
+                "stream_display_name": self.name,
+                "stream_source": ["127.0.0.1"],
+                "category_id": cat,
+                "stream_mode": "live"
+            }, verify=False)
+            
             return f"{base}/live/{c['user']}/{c['pass']}/{self.name.replace(' ','_')}.ts"
         except:
             return None
@@ -117,14 +144,12 @@ class StreamWorker(QObject):
     def run(self):
         start = time.time()
         folder = os.path.join(RECORDINGS_PATH, self.name.replace(" ", "_"))
+        
         if self.rec:
             os.makedirs(folder, exist_ok=True)
             
         xui = self._get_xui()
-        try:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                          data={"chat_id": TELEGRAM_CHAT_ID, "text": f"🟢 {self.name} Started"})
-        except: pass
+        send_telegram(f"🎬 <b>CHANNEL STARTED:</b> {self.name}")
         
         while self.running:
             cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-stimeout', '5000000', '-i', self.url, '-c', 'copy', '-f', 'mpegts']
@@ -134,34 +159,40 @@ class StreamWorker(QObject):
                 tgts.append(f"[f=mpegts]{os.path.join(folder, datetime.now().strftime('%H%M%S') + '.ts')}")
             if xui:
                 tgts.append(f"[f=mpegts:onfail=ignore]{xui}")
-                
+            
             if tgts:
                 cmd.extend(['-f', 'tee', "|".join(tgts)])
             else:
                 cmd.extend(['-f', 'null', '-'])
-            
+                
             try:
                 self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 while self.proc.poll() is None and self.running:
                     uptime = time.strftime("%H:%M:%S", time.gmtime(time.time() - start))
                     d_size = 0
                     if self.rec and os.path.exists(folder):
-                        try: d_size = sum(os.path.getsize(os.path.join(folder, f)) for f in os.listdir(folder)) / 1048576
+                        try:
+                            d_size = sum(os.path.getsize(os.path.join(folder, f)) for f in os.listdir(folder)) / 1048576
                         except: pass
+                    
                     self.stats_signal.emit(self.name, {"status": "ACTIVE", "uptime": uptime, "disk": f"{d_size:.1f} MB", "link": xui or "N/A"})
                     time.sleep(3)
-                if self.running: time.sleep(5)
-            except: time.sleep(10)
+                
+                if self.running:
+                    time.sleep(5)
+            except:
+                time.sleep(10)
 
     def stop(self):
         self.running = False
-        if self.proc: self.proc.terminate()
+        if self.proc:
+            self.proc.terminate()
 
-# --- ממשק ראשי ---
+# --- ממשק משתמש (UI) ---
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL MANAGER v12.1 (Fixed)")
+        self.setWindowTitle("X-HOTEL MANAGER v14.0 (Final Verified)")
         self.resize(1600, 1000)
         self.workers = {}
         self.net_io = psutil.net_io_counters()
@@ -170,40 +201,44 @@ class XHotelUI(QMainWindow):
         self.t = QTimer()
         self.t.timeout.connect(self.upd_stats)
         self.t.start(1000)
+        
+        # הודעת אתחול
+        send_telegram("✅ <b>SYSTEM ONLINE</b>\nDashboard initialized successfully.")
 
     def setup_ui(self):
         self.setStyleSheet("""
-            QMainWindow{background:#10121b;} 
-            QWidget{color:#e0e6ed;font-family:'Segoe UI';} 
-            QTabWidget::pane{border:0;background:#10121b;} 
-            QTabBar::tab{background:#1f2233;padding:12px 30px;margin:2px;border-radius:6px;font-weight:bold;} 
-            QTabBar::tab:selected{background:#00d4ff;color:black;} 
-            QLineEdit{background:#1f2233;border:1px solid #3b3f51;padding:10px;color:white;border-radius:6px;} 
-            QTableWidget{background:#151722;border:none;gridline-color:#2d303e;} 
-            QHeaderView::section{background:#1f2233;padding:8px;border:none;} 
-            QTextEdit{background:#0a0b10;color:#00e676;border-radius:8px;font-family:'Consolas';}
+            QMainWindow { background: #10121b; }
+            QWidget { color: #e0e6ed; font-family: 'Segoe UI'; }
+            QTabWidget::pane { border: 0; background: #10121b; }
+            QTabBar::tab { background: #1f2233; padding: 12px 30px; margin: 2px; border-radius: 6px; font-weight: bold; }
+            QTabBar::tab:selected { background: #00d4ff; color: black; }
+            QLineEdit { background: #1f2233; border: 1px solid #3b3f51; padding: 10px; color: white; border-radius: 6px; }
+            QTableWidget { background: #151722; border: none; gridline-color: #2d303e; }
+            QHeaderView::section { background: #1f2233; padding: 8px; border: none; }
+            QTextEdit { background: #0a0b10; color: #00e676; border-radius: 8px; font-family: 'Consolas'; }
         """)
+        
         main = QWidget()
         self.setCentralWidget(main)
         l = QVBoxLayout(main)
         
-        # Header
+        # כותרת
         h = QFrame()
         hl = QHBoxLayout(h)
         lbl = QLabel("COMMAND CENTER")
-        lbl.setStyleSheet("font-size:24px;font-weight:900;color:#00d4ff;")
+        lbl.setStyleSheet("font-size: 24px; font-weight: 900; color: #00d4ff;")
         hl.addWidget(lbl)
         l.addWidget(h)
         
         tabs = QTabWidget()
         l.addWidget(tabs)
 
-        # Tab 1: Live Operations
+        # טאב 1: תפעול
         t1 = QWidget()
         t1l = QVBoxLayout(t1)
         c_f = QFrame()
         gl = QGridLayout(c_f)
-        c_f.setStyleSheet("background:#1f2233;border-radius:12px;padding:10px;")
+        c_f.setStyleSheet("background: #1f2233; border-radius: 12px; padding: 10px;")
         
         self.url = QLineEdit("http://144.91.86.250/mbmWePBa")
         self.usr = QLineEdit("admin")
@@ -221,33 +256,30 @@ class XHotelUI(QMainWindow):
         gl.addWidget(self.m3u, 1, 1, 1, 4)
         
         b = QPushButton("LOAD")
-        b.setStyleSheet("background:#00d4ff;color:black;font-weight:bold;padding:10px;border-radius:6px;")
+        b.setStyleSheet("background: #00d4ff; color: black; font-weight: bold; padding: 10px; border-radius: 6px;")
         b.clicked.connect(self.load_m3u)
         gl.addWidget(b, 1, 5)
         t1l.addWidget(c_f)
         
         self.tbl = QTableWidget(0, 7)
         self.tbl.setHorizontalHeaderLabels(["SEL", "CHANNEL", "REC", "STATUS", "UPTIME", "DISK", "ACTION"])
-        # --- THE FIX IS HERE ---
-        self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch) 
-        # -----------------------
+        self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         t1l.addWidget(self.tbl)
         
         acts = QHBoxLayout()
         b1 = QPushButton("START STREAMING")
-        b1.setStyleSheet("background:#00e676;color:black;font-weight:bold;padding:15px;")
+        b1.setStyleSheet("background: #00e676; color: black; font-weight: bold; padding: 15px;")
         b1.clicked.connect(self.start_sel)
-        
         b2 = QPushButton("STOP ALL")
-        b2.setStyleSheet("background:#ff2e63;color:white;font-weight:bold;padding:15px;")
+        b2.setStyleSheet("background: #ff2e63; color: white; font-weight: bold; padding: 15px;")
         b2.clicked.connect(self.stop_all)
-        
         acts.addWidget(b1)
         acts.addWidget(b2)
         t1l.addLayout(acts)
+        
         tabs.addTab(t1, "📡 OPERATIONS")
 
-        # Tab 2: Analytics
+        # טאב 2: מדדים
         t2 = QWidget()
         t2l = QVBoxLayout(t2)
         gs = QHBoxLayout()
@@ -255,7 +287,6 @@ class XHotelUI(QMainWindow):
         self.g_ram = ProGauge("RAM", "%", color="#aa00ff")
         self.g_dl = ProGauge("DL", "MB", 50, "#00e676")
         self.g_ul = ProGauge("UL", "MB", 50, "#ffea00")
-        
         gs.addWidget(self.g_cpu)
         gs.addWidget(self.g_ram)
         gs.addWidget(self.g_dl)
@@ -268,45 +299,42 @@ class XHotelUI(QMainWindow):
         t2l.addWidget(self.log)
         tabs.addTab(t2, "📊 METRICS")
 
-        # Tab 3: System Tools
+        # טאב 3: כלים
         t3 = QWidget()
         t3l = QGridLayout(t3)
         t3l.setSpacing(20)
         
-        btn_open = ToolButton("OPEN RECORDINGS", "📂", "#3f51b5")
-        btn_open.clicked.connect(self.tool_open_folder)
-        btn_clean = ToolButton("CLEAN DISK NOW", "🧹", "#ff9800")
+        btn_test = ToolButton("TEST TELEGRAM", "📢", "#9c27b0")
+        btn_test.clicked.connect(self.tool_test_tg)
+        
+        btn_clean = ToolButton("CLEAN DISK", "🧹", "#ff9800")
         btn_clean.clicked.connect(self.tool_clean_disk)
-        btn_reboot = ToolButton("REBOOT SERVER", "🔄", "#d32f2f")
+        
+        btn_reboot = ToolButton("REBOOT", "🔄", "#d32f2f")
         btn_reboot.clicked.connect(self.tool_reboot)
+        
         btn_restart = ToolButton("RESTART APP", "🛑", "#00bcd4")
         btn_restart.clicked.connect(self.tool_restart_app)
         
-        t3l.addWidget(btn_open, 0, 0)
+        t3l.addWidget(btn_test, 0, 0)
         t3l.addWidget(btn_clean, 0, 1)
         t3l.addWidget(btn_reboot, 1, 0)
         t3l.addWidget(btn_restart, 1, 1)
-        t3l.addWidget(QLabel("System Tools Area - Use with caution"), 2, 0, 1, 2, Qt.AlignmentFlag.AlignCenter)
+        t3l.addWidget(QLabel("Tools Area"), 2, 0, 1, 2, Qt.AlignmentFlag.AlignCenter)
         
-        tabs.addTab(t3, "🛠️ SYSTEM TOOLS")
+        tabs.addTab(t3, "🛠️ TOOLS")
 
     # --- פונקציות ---
-    def tool_open_folder(self):
-        try:
-            subprocess.Popen(['xdg-open', RECORDINGS_PATH])
-            self.add_log("Opening recordings folder...")
-        except:
-            QMessageBox.warning(self, "Error", "Cannot open folder (No GUI File Manager found).")
+    def tool_test_tg(self):
+        send_telegram("🔔 <b>TEST MESSAGE</b>\nIf you see this, Telegram is working.")
+        QMessageBox.information(self, "Telegram", "Test message sent.")
 
     def tool_clean_disk(self):
-        reply = QMessageBox.question(self, 'Clean Disk', "Delete old recordings?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(self, 'Clean', "Sure?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
             os.system("/root/clean_recordings.sh")
-            self.add_log("Disk cleanup executed.")
 
     def tool_reboot(self):
-        reply = QMessageBox.critical(self, 'REBOOT', "Reboot Server?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(self, 'Reboot', "Sure?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
             os.system("reboot")
 
     def tool_restart_app(self):
@@ -325,17 +353,21 @@ class XHotelUI(QMainWindow):
         self.net_io = n
 
     def load_m3u(self):
+        url = self.m3u.text().strip()
+        if not url: return
         try:
-            d = requests.get(self.m3u.text(), timeout=10).text
+            self.add_log(f"Loading M3U: {url}")
+            d = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15, verify=False).text
             self.tbl.setRowCount(0)
             self.db = []
             n = "Cam"
-            for l in d.splitlines():
-                if "#EXTINF" in l: n = l.split(",")[-1].strip()
-                elif l.startswith("http"):
+            for line in d.splitlines():
+                if "#EXTINF" in line:
+                    n = line.split(",")[-1].strip()
+                elif line.startswith("http"):
                     r = self.tbl.rowCount()
                     self.tbl.insertRow(r)
-                    self.db.append({"name": n, "url": l})
+                    self.db.append({"name": n, "url": line})
                     
                     chk = QCheckBox()
                     cw = QWidget()
@@ -359,10 +391,10 @@ class XHotelUI(QMainWindow):
                     self.tbl.setItem(r, 5, QTableWidgetItem("0 MB"))
                     
                     b = QPushButton("STOP")
-                    b.setStyleSheet("background:#2d303e;color:#ff2e63;")
+                    b.setStyleSheet("background: #2d303e; color: #ff2e63;")
                     b.clicked.connect(lambda _, x=n: self.stop_one(x))
                     self.tbl.setCellWidget(r, 6, b)
-            self.add_log(f"Loaded {len(self.db)} chans")
+            self.add_log(f"Loaded {len(self.db)} channels")
         except Exception as e:
             self.add_log(f"Err: {e}")
 
@@ -424,7 +456,8 @@ class XHotelUI(QMainWindow):
                             self.tbl.cellWidget(r, 0).layout().itemAt(0).widget().setChecked(True)
                             self.tbl.cellWidget(r, 2).layout().itemAt(0).widget().setChecked(act[n])
                     self.start_sel()
-            except: pass
+            except:
+                pass
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
