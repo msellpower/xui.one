@@ -12,9 +12,8 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QFont
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["QT_QUICK_BACKEND"] = "software"
 
-# --- הפרדת רשויות: ראשים שונים למטרות שונות ---
-
-# 1. ראשים לפאנל (התחזות לדפדפן כדי לעבור חסימות)
+# --- כותרות ---
+# דפדפן (בשביל ה-API של הפאנל)
 API_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/javascript, */*; q=0.01',
@@ -22,7 +21,7 @@ API_HEADERS = {
     'Connection': 'keep-alive'
 }
 
-# 2. ראשים לשידור ול-M3U (התחזות לנגן כדי לקבל וידאו)
+# נגן (בשביל למשוך את השידור)
 STREAM_HEADERS = {
     'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18',
     'Accept': '*/*',
@@ -35,13 +34,17 @@ CONFIG_FILE = "/root/iptv_config.json"
 RECORDINGS_PATH = "/root/Recordings"
 DEFAULT_IP = "144.91.86.250"
 
-def send_telegram(msg, verbose=False):
+# --- פונקציית טלגרם משופרת שמחזירה שגיאה מלאה ---
+def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, verify=False, timeout=5)
-        if verbose and resp.status_code != 200: return f"Error {resp.status_code}: {resp.text}"
-        return "OK"
-    except Exception as e: return str(e)
+        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, verify=False, timeout=10)
+        if resp.status_code == 200:
+            return True, "OK"
+        else:
+            return False, f"Error {resp.status_code}: {resp.text}"
+    except Exception as e:
+        return False, f"Exception: {str(e)}"
 
 # --- רכיבים גרפיים ---
 class ToolButton(QPushButton):
@@ -79,7 +82,10 @@ class RecordingWorker(QThread):
         channel_path = os.path.join(RECORDINGS_PATH, safe_name)
         if self.record_local: os.makedirs(channel_path, exist_ok=True)
 
-        send_telegram(f"🎬 <b>STARTED:</b> {self.channel_name}")
+        # דיווח לטלגרם
+        ok, err = send_telegram(f"🎬 <b>STARTED:</b> {self.channel_name}")
+        if not ok: self.log_signal.emit(f"TG Error: {err}")
+
         start_time = time.time()
         
         while self.is_running:
@@ -89,30 +95,37 @@ class RecordingWorker(QThread):
             
             xui_target = ""
             c = self.iptv_config
+            
+            # --- שלב 1: בניית יעד הפאנל ---
             if c.get('ip') and c.get('port') and c.get('api_path'):
                 try:
                     base_url = f"http://{c['ip']}:{c['port']}"
                     api_endpoint = f"{base_url}{c['api_path']}"
                     
                     if c['user'] and c['pass']:
+                        # כתובת השידור לפאנל
                         xui_target = f"{base_url}/live/{c['user']}/{c['pass']}/{safe_name}.ts"
+                        
+                        # רישום הערוץ ב-API
                         try:
-                            # שימוש ב-API HEADERS (דפדפן) לרישום בפאנל
+                            self.log_signal.emit(f"Registering API: {api_endpoint}")
                             requests.post(f"{api_endpoint}?action=add_stream", data={
                                 "username":c['user'], "password":c['pass'],
                                 "stream_display_name":self.channel_name, "stream_source":["127.0.0.1"],
                                 "category_id":c.get('cat_id', '1'), "stream_mode":"live"
                             }, headers=API_HEADERS, verify=False, timeout=5)
-                        except: pass
+                        except Exception as e:
+                            self.log_signal.emit(f"API Register Fail: {e}")
                 except: pass
 
-            # שימוש ב-STREAM HEADERS (VLC) למשיכת הוידאו
+            # --- שלב 2: בניית הפקודה ---
             ua = STREAM_HEADERS['User-Agent']
             cmd = ['ffmpeg', '-y', '-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-headers', f'User-Agent: {ua}\r\n', '-i', self.url, '-c', 'copy']
 
             if xui_target:
                 tee_cmd = []
                 if self.record_local: tee_cmd.append(f"[f=mpegts]'{abs_output}'")
+                # הוספתי fifo (Buffer) כדי למנוע תקיעה אם השרת איטי
                 tee_cmd.append(f"[f=mpegts:onfail=ignore]{xui_target}")
                 cmd.extend(['-f', 'tee', "|".join(tee_cmd)])
             elif self.record_local:
@@ -120,8 +133,14 @@ class RecordingWorker(QThread):
             else:
                 cmd.extend(['-f', 'null', '-'])
 
+            # --- חשיפת הפקודה ללוג ---
+            # זה הקטע הקריטי: אנחנו נראה בדיוק מה FFmpeg מנסה לעשות
+            debug_cmd = " ".join(cmd)
+            self.log_signal.emit(f"FFMPEG CMD: {debug_cmd}")
+
             try:
                 self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                
                 while self.process.poll() is None and self.is_running:
                     uptime = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time))
                     disk = "0.0 MB"
@@ -129,17 +148,17 @@ class RecordingWorker(QThread):
                          try: disk = f"{os.path.getsize(abs_output)/1048576:.1f} MB"
                          except: pass
                     
-                    link_txt = "Local"
+                    link_txt = "Local Only"
                     if xui_target: link_txt = f"Panel ({c['port']})"
                     
                     self.stats_signal.emit(self.channel_name, {"status":"ACTIVE", "uptime":uptime, "disk":disk, "link":link_txt})
                     time.sleep(2)
                 
                 if self.is_running:
-                    self.log_signal.emit(f"⚠️ Stream {self.channel_name} dropped. Restarting...")
+                    self.log_signal.emit(f"⚠️ Process Died. Restarting {self.channel_name}...")
                     time.sleep(2)
             except Exception as e:
-                self.log_signal.emit(f"Error: {e}")
+                self.log_signal.emit(f"Exec Error: {e}")
                 time.sleep(5)
 
     def stop(self):
@@ -153,12 +172,12 @@ class RecordingWorker(QThread):
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL v31.0 (The Hybrid)"); self.resize(1600, 1000)
+        self.setWindowTitle("X-HOTEL v32.0 (The Inspector)"); self.resize(1600, 1000)
         self.workers={}; self.net_io=psutil.net_io_counters()
         self.setup_ui(); QTimer.singleShot(500, self.restore); self.t=QTimer(); self.t.timeout.connect(self.upd_stats); self.t.start(1000)
         
-        res = send_telegram("✅ <b>SYSTEM ONLINE</b>", verbose=True)
-        if res != "OK": self.add_log(f"TG Init Error: {res}")
+        # הודעה ראשונית
+        self.add_log("System Started. Click 'TEST TELEGRAM' to debug connection.")
 
     def setup_ui(self):
         self.setStyleSheet("QMainWindow{background:#10121b;} QWidget{color:#e0e6ed;font-family:'Segoe UI';} QTabWidget::pane{border:0;background:#10121b;} QTabBar::tab{background:#1f2233;padding:12px 30px;margin:2px;border-radius:6px;font-weight:bold;} QTabBar::tab:selected{background:#00d4ff;color:black;} QLineEdit{background:#1f2233;border:1px solid #3b3f51;padding:10px;color:white;border-radius:6px;} QSpinBox{background:#1f2233;border:1px solid #3b3f51;padding:10px;color:white;border-radius:6px;font-weight:bold;} QTableWidget{background:#151722;border:none;gridline-color:#2d303e;} QHeaderView::section{background:#1f2233;padding:8px;border:none;} QTextEdit{background:#0a0b10;color:#00e676;border-radius:8px;font-family:'Consolas';}")
@@ -208,16 +227,14 @@ class XHotelUI(QMainWindow):
         url = f"http://{self.ip.text()}:{self.port.text()}{self.api_path.text()}"
         auth = f"username={self.usr.text()}&password={self.pw.text()}"
         self.add_log(f"Testing: {url}...")
-        
         try:
-            # שימוש ב-API HEADERS (Chrome)
             res = requests.get(f"{url}?action=stats&{auth}", headers=API_HEADERS, timeout=8, verify=False)
-            
             if res.status_code == 200:
                 if "server_name" in res.text or "total_users" in res.text or res.text.strip().startswith("{"):
                     QMessageBox.information(self, "Success", "Connection Established!")
                     self.add_log("API Connection Success.")
                 else:
+                     self.add_log(f"Strange Resp: {res.text[:100]}")
                      QMessageBox.warning(self, "Check", "Got 200 OK, but response looks empty.")
             else:
                 QMessageBox.critical(self, "Error", f"Failed. Status: {res.status_code}")
@@ -225,29 +242,30 @@ class XHotelUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Connection Failed:\n{e}")
 
     def tool_test_tg(self): 
-        res = send_telegram("🔔 <b>TEST</b> OK", verbose=True)
-        if res == "OK": QMessageBox.information(self,"Success","Message Sent!")
-        else: QMessageBox.critical(self, "Telegram Error", f"Failed:\n{res}")
+        self.add_log("Testing Telegram...")
+        ok, msg = send_telegram("🔔 <b>TEST MESSAGE</b>")
+        if ok: 
+            self.add_log("TG Success.")
+            QMessageBox.information(self,"Success","Message Sent!")
+        else: 
+            self.add_log(f"TG FAILED: {msg}")
+            QMessageBox.critical(self, "Telegram Error", f"Failed:\n{msg}")
 
     def tool_clean_disk(self): os.system("/root/clean_recordings.sh") if QMessageBox.question(self,'C',"Sure?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes else None
     def tool_reboot(self): os.system("reboot") if QMessageBox.question(self,'R',"Sure?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes else None
     def tool_restart_app(self): QApplication.quit(); os.execl(sys.executable, sys.executable, *sys.argv)
-    def add_log(self, m): self.log.append(f"[{datetime.now().strftime('%H:%M')}] {m}")
+    def add_log(self, m): self.log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}")
     def upd_stats(self): self.g_cpu.set_value(psutil.cpu_percent()); self.g_ram.set_value(psutil.virtual_memory().percent); n=psutil.net_io_counters(); self.g_dl.set_value((n.bytes_recv-self.net_io.bytes_recv)/1048576); self.g_ul.set_value((n.bytes_sent-self.net_io.bytes_sent)/1048576); self.net_io=n
     
     def load_m3u(self):
         url = self.m3u.text().strip(); 
         if not url: return
-        self.add_log(f"Fetching: {url}")
-        
+        self.add_log(f"Fetching M3U: {url}")
         data = ""
-        # 1. ניסיון ראשי: requests עם STREAM_HEADERS (VLC)
         try:
             r = requests.get(url, headers=STREAM_HEADERS, timeout=30, verify=False)
             if r.status_code == 200: data = r.text
         except: pass
-        
-        # 2. ניסיון משני: CURL עם גיבוי
         if not data or len(data) < 50:
             self.add_log("Requests failed. Using CURL...")
             try: data = subprocess.check_output(['curl', '-k', '-L', url], text=True)
