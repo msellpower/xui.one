@@ -1,261 +1,438 @@
-import sys, subprocess, threading, time, os, re, requests, psutil, json
+import sys, subprocess, threading, time, os, re, requests, psutil, json, math
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLineEdit, QPushButton, QTableWidget,
                              QTableWidgetItem, QHeaderView, QLabel, QCheckBox, 
                              QFrame, QProgressBar, QMessageBox, QGridLayout, QTabWidget, QTextEdit)
-from PyQt6.QtCore import pyqtSignal, QObject, Qt, QTimer
+from PyQt6.QtCore import pyqtSignal, QObject, Qt, QTimer, QRectF
+from PyQt6.QtGui import QPainter, QColor, QPen, QFont
 
 # --- הגדרות טלגרם ---
 TELEGRAM_TOKEN = "8307008722:AAHY-QYNYyTnOwjS0q4VGfA0_iUiQBxYHBc"
 TELEGRAM_CHAT_ID = "-5125327073"
 
-def send_telegram_msg(message):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-        requests.post(url, data=payload, timeout=5)
-    except: pass
-
+# --- הגדרות מערכת ---
 os.environ["QT_QUICK_BACKEND"] = "software"
 CONFIG_FILE = "/root/iptv_config.json"
+RECORDINGS_PATH = "/root/Recordings"
 
-class RecordingWorker(QObject):
-    status_changed = pyqtSignal(str, dict)
-    log_msg = pyqtSignal(str)
-
-    def __init__(self, channel_name, url, output_folder, iptv_config=None):
+# --- רכיב גרפי: שעון אנליטי (Gauge) ---
+class AnalogGauge(QWidget):
+    def __init__(self, title="Metric", max_val=100, unit="%"):
         super().__init__()
-        self.channel_name = channel_name
+        self.value = 0
+        self.max_val = max_val
+        self.title = title
+        self.unit = unit
+        self.setMinimumSize(150, 150)
+
+    def set_value(self, val):
+        self.value = val
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # חישובים
+        w, h = self.width(), self.height()
+        size = min(w, h)
+        rect = QRectF((w-size)/2 + 10, (h-size)/2 + 10, size-20, size-20)
+        
+        # רקע
+        painter.setPen(QPen(QColor("#2c2f33"), 10, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawArc(rect, 135 * 16, 270 * 16)
+
+        # קשת הערך (צבע משתנה לפי עומס)
+        if self.value > self.max_val * 0.8: color = QColor("#ff4d4d") # Red
+        elif self.value > self.max_val * 0.5: color = QColor("#ffcc00") # Yellow
+        else: color = QColor("#00e676") # Green
+        
+        painter.setPen(QPen(color, 10, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        angle = int(270 * (self.value / self.max_val))
+        if angle > 270: angle = 270
+        painter.drawArc(rect, 225 * 16, -angle * 16)
+
+        # טקסט
+        painter.setPen(QColor("#ffffff"))
+        painter.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, f"{self.value:.1f}{self.unit}")
+        
+        painter.setFont(QFont("Arial", 10))
+        painter.drawText(int(w/2)-50, int(h)-20, 100, 20, Qt.AlignmentFlag.AlignCenter, self.title)
+
+# --- לוגיקת שידור (Backend) ---
+class StreamWorker(QObject):
+    stats_signal = pyqtSignal(str, dict)
+    log_signal = pyqtSignal(str)
+
+    def __init__(self, name, url, config, record_to_disk=True):
+        super().__init__()
+        self.name = name
         self.url = url
-        self.output_folder = os.path.abspath(output_folder)
-        self.iptv_config = iptv_config
+        self.config = config
+        self.record_to_disk = record_to_disk
         self.is_running = True
         self.process = None
 
-    def get_or_create_category(self, base_url, user, password):
-        cat_name = "Channels"
+    def _send_telegram(self, msg):
         try:
-            self.log_msg.emit(f"🔍 Checking category '{cat_name}'...")
-            auth = f"username={user}&password={password}"
-            # ניסיון גמיש למציאת ה-API
-            api_path = f"{base_url}/api.php"
-            res = requests.get(f"{api_path}?action=get_categories&{auth}", timeout=7).json()
-            
-            for c in res:
-                if c.get('category_name') == cat_name:
-                    self.log_msg.emit(f"✅ Found category ID: {c.get('category_id')}")
-                    return c.get('category_id')
-            
-            self.log_msg.emit(f"➕ Creating new category '{cat_name}'...")
-            new_cat = requests.post(f"{api_path}?action=add_category", 
-                                    data={"username":user,"password":password,"category_name":cat_name,"category_type":"live"}).json()
-            return new_cat.get('category_id', "1")
-        except Exception as e:
-            self.log_msg.emit(f"❌ API Category Error: {str(e)}")
-            return "1"
-
-    def start_recording(self):
-        start_time = time.time()
-        safe_name = re.sub(r'[\\/*?:"<>|]', "", self.channel_name).strip().replace(" ", "_")
-        channel_path = os.path.join(self.output_folder, safe_name)
-        
-        # וידוא הרשאות תיקייה
-        try:
-            os.makedirs(channel_path, exist_ok=True)
-            os.chmod(channel_path, 0o777)
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=3)
         except: pass
-        
-        broadcast_link = "---"
-        if self.iptv_config and all(self.iptv_config.values()):
-            c = self.iptv_config
-            base = c['server'].split('/dashboard')[0].rstrip('/')
-            cat_id = self.get_or_create_category(base, c['user'], c['pass'])
-            
-            # יצירת/עדכון סטרים
-            api_path = f"{base}/api.php"
-            requests.post(f"{api_path}?action=add_stream", 
-                          data={"username":c['user'],"password":c['pass'],"stream_display_name":self.channel_name,
-                                "stream_source":["127.0.0.1"],"category_id":cat_id,"stream_mode":"live"})
-            
-            broadcast_link = f"{base}/live/{c['user']}/{c['pass']}/{safe_name}.ts"
 
-        send_telegram_msg(f"🚀 <b>ערוץ עלה לאוויר</b>\nשם: {self.channel_name}")
+    def _get_api_stream_url(self):
+        """פונקציה חכמה ליצירת קטגוריה וסטרים ב-XUI"""
+        if not self.config or not self.config.get('server'): return None
+        
+        c = self.config
+        base = c['server'].split('/dashboard')[0].rstrip('/')
+        api = f"{base}/api.php"
+        auth = f"username={c['user']}&password={c['pass']}"
+        
+        try:
+            # 1. השגת ID קטגוריה
+            cat_id = "1"
+            cats = requests.get(f"{api}?action=get_categories&{auth}", timeout=5).json()
+            found = False
+            for cat in cats:
+                if cat.get('category_name') == "Channels":
+                    cat_id = cat.get('category_id')
+                    found = True
+                    break
+            
+            if not found:
+                self.log_signal.emit(f"Creating category 'Channels'...")
+                res = requests.post(f"{api}?action=add_category", data={**c, "category_name": "Channels", "category_type": "live"}).json()
+                cat_id = res.get('category_id', "1")
+
+            # 2. יצירת סטרים
+            safe_name = re.sub(r'[\\/*?:"<>|]', "", self.name).strip()
+            requests.post(f"{api}?action=add_stream", data={
+                "username": c['user'], "password": c['pass'],
+                "stream_display_name": self.name, "stream_source": ["127.0.0.1"],
+                "category_id": cat_id, "stream_mode": "live"
+            })
+            
+            return f"{base}/live/{c['user']}/{c['pass']}/{safe_name}.ts"
+        except Exception as e:
+            self.log_signal.emit(f"API Error ({self.name}): {e}")
+            return None
+
+    def run(self):
+        start_ts = time.time()
+        safe_name = self.name.replace(" ", "_")
+        folder = os.path.join(RECORDINGS_PATH, safe_name)
+        if self.record_to_disk:
+            os.makedirs(folder, exist_ok=True)
+
+        xui_link = self._get_api_stream_url()
+        self._send_telegram(f"🎬 <b>ערוץ הופעל:</b> {self.name}\n<b>הקלטה:</b> {'פעילה' if self.record_to_disk else 'כבויה'}")
 
         while self.is_running:
-            timestamp = datetime.now().strftime("%H%M%S")
-            output_file = os.path.join(channel_path, f"rec_{timestamp}.ts")
-            
-            # פקודת FFmpeg עם דגלי יציבות
-            cmd = ['ffmpeg', '-y', '-re', '-i', self.url, '-c', 'copy', '-f', 'mpegts']
-            
-            if broadcast_link != "---":
-                cmd.extend([f"tee:f=mpegts|{output_file}|{broadcast_link}"])
-                # שימוש בכתובת המלאה ל-Tee
-                full_cmd = f"ffmpeg -y -re -i \"{self.url}\" -c copy -f tee \"[f=mpegts]{output_file}|[f=mpegts:onfail=ignore]{broadcast_link}\""
-                self.process = subprocess.Popen(shlex.split(full_cmd), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-            else:
-                self.process = subprocess.Popen(cmd + [output_file], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            # בניית פקודת FFmpeg לאמינות מקסימלית (Production Grade)
+            cmd = [
+                'ffmpeg', '-y', 
+                '-rtsp_transport', 'tcp', # מונע מריחות בשידור
+                '-stimeout', '5000000',   # Timeout של 5 שניות אם המצלמה נופלת
+                '-i', self.url,
+                '-c', 'copy', '-f', 'mpegts'
+            ]
 
+            output_targets = []
+            
+            # יעד 1: הקלטה לדיסק (אם נבחר)
+            current_file = ""
+            if self.record_to_disk:
+                timestamp = datetime.now().strftime("%H%M%S")
+                current_file = os.path.join(folder, f"{timestamp}.ts")
+                output_targets.append(f"[f=mpegts]{current_file}")
+            
+            # יעד 2: שידור ל-XUI
+            if xui_link:
+                output_targets.append(f"[f=mpegts:onfail=ignore]{xui_link}")
+            
+            # הרכבת ה-TEE Muxer
+            if output_targets:
+                tee_cmd = "|".join(output_targets)
+                cmd.extend(['-f', 'tee', tee_cmd])
+            else:
+                # Fallback למקרה שאין לאן לשדר
+                cmd.extend(['-f', 'null', '-'])
+
+            self.log_signal.emit(f"Starting FFmpeg for {self.name}")
+            
             try:
+                self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                
+                # לולאת ניטור
                 while self.process.poll() is None and self.is_running:
-                    uptime = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time))
-                    size = sum(os.path.getsize(os.path.join(channel_path, f)) for f in os.listdir(channel_path) if os.path.isfile(os.path.join(channel_path, f)))
-                    self.status_changed.emit(self.channel_name, {"status": "Active", "uptime": uptime, "size": f"{size/(1024*1024):.1f}MB", "link": broadcast_link})
+                    uptime = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_ts))
+                    
+                    disk_usage = 0
+                    if self.record_to_disk:
+                        try: disk_usage = sum(os.path.getsize(os.path.join(folder, f)) for f in os.listdir(folder))/1048576
+                        except: pass
+                    
+                    self.stats_signal.emit(self.name, {
+                        "status": "Active", "uptime": uptime, 
+                        "disk": f"{disk_usage:.1f} MB", "link": xui_link or "N/A"
+                    })
+                    time.sleep(3)
+                
+                if self.is_running:
+                    self.log_signal.emit(f"⚠️ Stream {self.name} dropped. Reconnecting...")
+                    self._send_telegram(f"⚠️ <b>ניתוק זוהה:</b> {self.name}\nמנסה להתחבר מחדש...")
                     time.sleep(5)
-                if self.is_running: 
-                    self.log_msg.emit(f"⚠️ Reconnecting {self.channel_name}...")
-                    time.sleep(10)
-            except: time.sleep(10)
+            except Exception as e:
+                self.log_signal.emit(f"Critical Error: {e}")
+                time.sleep(10)
 
     def stop(self):
         self.is_running = False
-        if self.process: self.process.kill()
+        if self.process: self.process.terminate()
 
-import shlex
-
-class IPTVHotelSuite(QMainWindow):
+# --- ממשק משתמש (GUI) ---
+class HotelDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL IPTV COMMAND CENTER v9.6")
-        self.resize(1500, 950)
-        self.active_workers = {}
-        self.last_net_io = psutil.net_io_counters()
-        
-        # Styling
+        self.setWindowTitle("XUI Hotel Enterprise Manager v10.0")
+        self.resize(1600, 950)
+        self.workers = {}
+        self.net_io = psutil.net_io_counters()
+        self.setup_ui()
+        self.apply_styles()
+        QTimer.singleShot(1000, self.restore_state)
+
+    def apply_styles(self):
         self.setStyleSheet("""
-            QMainWindow { background-color: #0f111a; }
-            QTabWidget::pane { border: 1px solid #1a1c2c; background: #0f111a; }
-            QTabBar::tab { background: #1a1c2c; color: #a6accd; padding: 15px; border-top-left-radius: 10px; border-top-right-radius: 10px; min-width: 150px; }
-            QTabBar::tab:selected { background: #292d3e; color: #89ddff; font-weight: bold; }
-            QLabel { color: #89ddff; font-weight: bold; }
-            QPushButton { background-color: #3b3f51; color: white; border-radius: 8px; font-weight: bold; border: 1px solid #89ddff; }
-            QPushButton:hover { background-color: #89ddff; color: #0f111a; }
-            QLineEdit { background-color: #1a1c2c; color: white; border: 1px solid #3b3f51; border-radius: 5px; padding: 8px; }
-            QTableWidget { background-color: #0f111a; color: #a6accd; border: none; gridline-color: #1a1c2c; }
+            QMainWindow { background-color: #121212; color: #e0e0e0; }
+            QTabWidget::pane { border: 1px solid #333; background: #1e1e1e; }
+            QTabBar::tab { background: #2c2c2c; padding: 12px 25px; margin-right: 2px; color: #aaa; }
+            QTabBar::tab:selected { background: #007acc; color: white; font-weight: bold; }
+            QLineEdit { background: #252526; border: 1px solid #3e3e42; color: white; padding: 5px; }
+            QPushButton { background: #0e639c; color: white; border: none; padding: 8px; font-weight: bold; }
+            QPushButton:hover { background: #1177bb; }
+            QPushButton#stop_btn { background: #d32f2f; }
+            QTableWidget { background: #1e1e1e; border: none; gridline-color: #333; }
+            QHeaderView::section { background: #252526; padding: 5px; border: none; font-weight: bold; }
         """)
+
+    def setup_ui(self):
+        tabs = QTabWidget(); self.setCentralWidget(tabs)
         
-        self.init_ui()
-        QTimer.singleShot(1000, self.auto_load_last_state)
-        self.stats_timer = QTimer(); self.stats_timer.timeout.connect(self.update_live_stats); self.stats_timer.start(2000)
-
-    def init_ui(self):
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        main_layout = QVBoxLayout(main_widget)
-
-        # Header with Stats
-        header = QFrame(); header.setFixedHeight(80)
-        h_layout = QHBoxLayout(header)
-        self.net_lbl = QLabel("NETWORK: IN 0 KB/s | OUT 0 KB/s")
-        self.cpu_lbl = QLabel("CPU: 0%")
-        h_layout.addWidget(self.net_lbl); h_layout.addStretch(); h_layout.addWidget(self.cpu_lbl)
-        main_layout.addWidget(header)
-
-        self.tabs = QTabWidget()
-        main_layout.addWidget(self.tabs)
-
-        # Tab 1: Control & Streams
-        self.tab_control = QWidget(); control_layout = QVBoxLayout(self.tab_control)
+        # --- TAB 1: OPERATIONS ---
+        ops_widget = QWidget(); ops_layout = QVBoxLayout(ops_widget)
         
-        # Config Card
-        conf_card = QFrame(); conf_card.setStyleSheet("background: #1a1c2c; border-radius: 15px; padding: 10px;")
-        grid = QGridLayout(conf_card)
-        self.server_i = QLineEdit("http://144.91.86.250/mbmWePBa"); self.user_i = QLineEdit("admin"); self.pass_i = QLineEdit("MazalTovLanu")
-        self.m3u_i = QLineEdit(); self.m3u_i.setPlaceholderText("M3U URL Here...")
-        grid.addWidget(QLabel("PORTAL URL"), 0, 0); grid.addWidget(self.server_i, 0, 1)
-        grid.addWidget(QLabel("USER"), 0, 2); grid.addWidget(self.user_i, 0, 3)
-        grid.addWidget(QLabel("PASS"), 0, 4); grid.addWidget(self.pass_i, 0, 5)
-        grid.addWidget(QLabel("M3U LIST"), 1, 0); grid.addWidget(self.m3u_i, 1, 1, 1, 4)
-        btn_load = QPushButton("LOAD SYSTEM"); btn_load.setFixedHeight(40); btn_load.clicked.connect(self.load_playlist)
-        grid.addWidget(btn_load, 1, 5)
-        control_layout.addWidget(conf_card)
+        # Config Area
+        conf_group = QFrame(); conf_layout = QGridLayout(conf_group)
+        self.url_in = QLineEdit("http://144.91.86.250/mbmWePBa")
+        self.user_in = QLineEdit("admin"); self.pass_in = QLineEdit("MazalTovLanu")
+        self.m3u_in = QLineEdit(); self.m3u_in.setPlaceholderText("Paste M3U URL...")
+        
+        conf_layout.addWidget(QLabel("Portal:"), 0, 0); conf_layout.addWidget(self.url_in, 0, 1)
+        conf_layout.addWidget(QLabel("User:"), 0, 2); conf_layout.addWidget(self.user_in, 0, 3)
+        conf_layout.addWidget(QLabel("Pass:"), 0, 4); conf_layout.addWidget(self.pass_in, 0, 5)
+        conf_layout.addWidget(QLabel("M3U List:"), 1, 0); conf_layout.addWidget(self.m3u_in, 1, 1, 1, 4)
+        load_btn = QPushButton("Load Channels"); load_btn.clicked.connect(self.load_m3u)
+        conf_layout.addWidget(load_btn, 1, 5)
+        ops_layout.addWidget(conf_group)
 
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["SEL", "CHANNEL NAME", "STATUS", "UPTIME", "DISK", "XUI LINK"])
+        # Table
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Sel", "Channel", "Rec?", "Status", "Uptime", "Storage", "Action"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        control_layout.addWidget(self.table)
+        self.table.setColumnWidth(0, 50); self.table.setColumnWidth(2, 50)
+        ops_layout.addWidget(self.table)
         
-        btn_start = QPushButton("🚀 INITIATE SYSTEM FLOW"); btn_start.setFixedHeight(50); btn_start.clicked.connect(self.start_selected)
-        control_layout.addWidget(btn_start)
+        # Global Actions
+        act_layout = QHBoxLayout()
+        start_all = QPushButton("START SELECTED"); start_all.clicked.connect(self.start_selected)
+        stop_all = QPushButton("STOP ALL SYSTEM"); stop_all.setObjectName("stop_btn"); stop_all.clicked.connect(self.stop_all)
+        act_layout.addWidget(start_all); act_layout.addWidget(stop_all)
+        ops_layout.addLayout(act_layout)
         
-        self.tabs.addTab(self.tab_control, "COMMAND CENTER")
+        tabs.addTab(ops_widget, "📡 Live Operations")
 
-        # Tab 2: Logs & System
-        self.tab_logs = QWidget(); log_layout = QVBoxLayout(self.tab_logs)
-        self.log_output = QTextEdit(); self.log_output.setReadOnly(True); self.log_output.setStyleSheet("background: #000; color: #00ff00; font-family: 'Courier New';")
-        log_layout.addWidget(QLabel("SYSTEM DEBUG LOGS:"))
-        log_layout.addWidget(self.log_output)
-        self.tabs.addTab(self.tab_logs, "SYSTEM LOGS")
+        # --- TAB 2: ANALYTICS (SCALES) ---
+        stats_widget = QWidget(); stats_layout = QGridLayout(stats_widget)
+        
+        self.cpu_gauge = AnalogGauge("CPU Load", 100, "%")
+        self.ram_gauge = AnalogGauge("RAM Usage", 100, "%")
+        self.net_in_gauge = AnalogGauge("Network IN", 50, "MB/s") # Scale up to 50MB/s
+        self.net_out_gauge = AnalogGauge("Network OUT", 50, "MB/s")
+        
+        stats_layout.addWidget(self.cpu_gauge, 0, 0); stats_layout.addWidget(self.ram_gauge, 0, 1)
+        stats_layout.addWidget(self.net_in_gauge, 1, 0); stats_layout.addWidget(self.net_out_gauge, 1, 1)
+        
+        # Logs Console
+        self.logs = QTextEdit(); self.logs.setReadOnly(True)
+        stats_layout.addWidget(QLabel("System Logs:"), 2, 0)
+        stats_layout.addWidget(self.logs, 3, 0, 1, 2)
+        
+        tabs.addTab(stats_widget, "📊 Analytics & Health")
 
-    def update_live_stats(self):
-        # Network
-        new_net = psutil.net_io_counters()
-        in_s = (new_net.bytes_recv - self.last_net_io.bytes_recv) / 2048
-        out_s = (new_net.bytes_sent - self.last_net_io.bytes_sent) / 2048
-        self.net_lbl.setText(f"NETWORK: IN {in_s:.1f} KB/s | OUT {out_s:.1f} KB/s")
-        self.cpu_lbl.setText(f"CPU: {psutil.cpu_percent()}% | RAM: {psutil.virtual_memory().percent}%")
-        self.last_net_io = new_net
+        # Updates Timer
+        self.timer = QTimer(); self.timer.timeout.connect(self.update_system_stats); self.timer.start(1500)
 
-    def add_log(self, msg):
+    def update_system_stats(self):
+        # CPU/RAM
+        self.cpu_gauge.set_value(psutil.cpu_percent())
+        self.ram_gauge.set_value(psutil.virtual_memory().percent)
+        
+        # Network Speed Calc
+        new_io = psutil.net_io_counters()
+        down = (new_io.bytes_recv - self.net_io.bytes_recv) / (1024 * 1024) # MB
+        up = (new_io.bytes_sent - self.net_io.bytes_sent) / (1024 * 1024)   # MB
+        self.net_in_gauge.set_value(down * 0.66) # Adjusted for per-second view
+        self.net_out_gauge.set_value(up * 0.66)
+        self.net_io = new_io
+
+    def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
-        self.log_output.append(f"[{ts}] {msg}")
+        self.logs.append(f"[{ts}] {msg}")
+        # Auto scroll
+        sb = self.logs.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
-    def load_playlist(self):
+    def load_m3u(self):
+        url = self.m3u_in.text()
+        if not url: return
         try:
-            res = requests.get(self.m3u_i.text(), timeout=10)
-            self.channels_data = []
-            for line in res.text.splitlines():
-                if line.startswith("#EXTINF"): name = re.search(r',([^,]+)$', line).group(1).strip()
-                elif line.startswith("http"): self.channels_data.append({'name': name, 'url': line})
-            self.refresh_table(); self.add_log(f"Loaded {len(self.channels_data)} channels.")
-        except Exception as e: self.add_log(f"Error loading M3U: {e}")
-
-    def refresh_table(self):
-        self.table.setRowCount(0)
-        for ch in self.channels_data:
-            r = self.table.rowCount(); self.table.insertRow(r)
-            chk = QCheckBox(); cw = QWidget(); cl = QHBoxLayout(cw); cl.addWidget(chk); cl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.table.setCellWidget(r, 0, cw)
-            self.table.setItem(r, 1, QTableWidgetItem(ch['name']))
-            for i in range(2, 6): self.table.setItem(r, i, QTableWidgetItem("---"))
+            self.log("Downloading M3U...")
+            data = requests.get(url, timeout=10).text
+            self.table.setRowCount(0)
+            self.channels_db = []
+            
+            name = "Unknown"
+            for line in data.splitlines():
+                if "#EXTINF" in line:
+                    name = line.split(",")[-1].strip()
+                elif line.startswith("http"):
+                    r = self.table.rowCount()
+                    self.table.insertRow(r)
+                    
+                    # Checkbox Select
+                    chk = QCheckBox(); chk_w = QWidget(); l = QHBoxLayout(chk_w); l.addWidget(chk); l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    self.table.setCellWidget(r, 0, chk_w)
+                    
+                    # Name
+                    self.table.setItem(r, 1, QTableWidgetItem(name))
+                    
+                    # Record Toggle (New Feature)
+                    rec_chk = QCheckBox(); rec_chk.setChecked(True) # Default ON
+                    rec_w = QWidget(); rl = QHBoxLayout(rec_w); rl.addWidget(rec_chk); rl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    self.table.setCellWidget(r, 2, rec_w)
+                    
+                    self.table.setItem(r, 3, QTableWidgetItem("Idle"))
+                    self.table.setItem(r, 4, QTableWidgetItem("00:00"))
+                    self.table.setItem(r, 5, QTableWidgetItem("0 MB"))
+                    
+                    # Individual Action
+                    btn = QPushButton("Toggle"); btn.clicked.connect(lambda _, n=name: self.toggle_single(n))
+                    self.table.setCellWidget(r, 6, btn)
+                    
+                    self.channels_db.append({"name": name, "url": line})
+            self.log(f"Loaded {len(self.channels_db)} channels.")
+        except Exception as e:
+            self.log(f"Error loading M3U: {e}")
 
     def start_selected(self):
-        conf = {'server': self.server_i.text(), 'user': self.user_i.text(), 'pass': self.pass_i.text()}
+        conf = {"server": self.url_in.text(), "user": self.user_in.text(), "pass": self.pass_in.text()}
+        
         for r in range(self.table.rowCount()):
-            chk_widget = self.table.cellWidget(r, 0)
-            if chk_widget and chk_widget.layout().itemAt(0).widget().isChecked():
+            # Check if selected
+            sel_chk = self.table.cellWidget(r, 0).layout().itemAt(0).widget()
+            if sel_chk.isChecked():
                 name = self.table.item(r, 1).text()
-                if name not in self.active_workers:
-                    worker = RecordingWorker(name, self.channels_data[r]['url'], "/root/Recordings", conf)
-                    worker.status_changed.connect(self.update_row)
-                    worker.log_msg.connect(self.add_log)
-                    threading.Thread(target=worker.start_recording, daemon=True).start()
-                    self.active_workers[name] = worker
+                # Check record status
+                rec_chk = self.table.cellWidget(r, 2).layout().itemAt(0).widget()
+                should_rec = rec_chk.isChecked()
+                
+                if name not in self.workers:
+                    url = self.channels_db[r]["url"]
+                    self.start_worker(name, url, conf, should_rec)
+        
         self.save_state()
 
-    def update_row(self, name, s):
+    def start_worker(self, name, url, conf, record):
+        w = StreamWorker(name, url, conf, record)
+        w.stats_signal.connect(self.update_row_stats)
+        w.log_signal.connect(self.log)
+        threading.Thread(target=w.run, daemon=True).start()
+        self.workers[name] = w
+
+    def toggle_single(self, name):
+        if name in self.workers:
+            self.workers[name].stop()
+            del self.workers[name]
+            self.log(f"Stopped {name}")
+            # Update UI to Idle
+            for r in range(self.table.rowCount()):
+                if self.table.item(r, 1).text() == name:
+                    self.table.item(r, 3).setText("Stopped")
+                    self.table.item(r, 3).setForeground(Qt.GlobalColor.red)
+        else:
+            # Find and start
+            self.log(f"Starting {name} manually...")
+            # Logic to find URL and start (Simplified for bulk logic)
+            self.start_selected() 
+
+    def update_row_stats(self, name, data):
         for r in range(self.table.rowCount()):
             if self.table.item(r, 1).text() == name:
-                self.table.item(r, 2).setText(s['status'])
-                self.table.item(r, 3).setText(s['uptime'])
-                self.table.item(r, 4).setText(s['size'])
-                self.table.item(r, 5).setText(s['link'])
-                self.table.item(r, 2).setForeground(Qt.GlobalColor.green)
+                item_status = self.table.item(r, 3)
+                item_status.setText(data['status'])
+                item_status.setForeground(QColor("#00e676")) # Green
+                
+                self.table.item(r, 4).setText(data['uptime'])
+                self.table.item(r, 5).setText(data['disk'])
+
+    def stop_all(self):
+        for w in self.workers.values(): w.stop()
+        self.workers.clear()
+        self.log("All streams stopped.")
 
     def save_state(self):
-        state = {"server": self.server_i.text(), "user": self.user_i.text(), "pass": self.pass_i.text(), "m3u": self.m3u_i.text(), "active": list(self.active_workers.keys())}
+        active_list = []
+        for name, w in self.workers.items():
+            active_list.append({"name": name, "rec": w.record_to_disk})
+            
+        state = {
+            "url": self.url_in.text(), "user": self.user_in.text(), "pass": self.pass_in.text(),
+            "m3u": self.m3u_in.text(), "active": active_list
+        }
         with open(CONFIG_FILE, "w") as f: json.dump(state, f)
 
-    def auto_load_last_state(self):
+    def restore_state(self):
         if os.path.exists(CONFIG_FILE):
             try:
-                with open(CONFIG_FILE, "r") as f:
-                    s = json.load(f); self.m3u_i.setText(s.get("m3u","")); self.load_playlist()
+                with open(CONFIG_FILE, "r") as f: s = json.load(f)
+                self.url_in.setText(s.get("url","")); self.user_in.setText(s.get("user",""))
+                self.pass_in.setText(s.get("pass","")); self.m3u_in.setText(s.get("m3u",""))
+                
+                if s.get("m3u"):
+                    self.load_m3u()
+                    # Restore active
+                    active_map = {item["name"]: item["rec"] for item in s.get("active", [])}
+                    
+                    conf = {"server": self.url_in.text(), "user": self.user_in.text(), "pass": self.pass_in.text()}
+                    
                     for r in range(self.table.rowCount()):
-                        if self.table.item(r,1).text() in s.get("active", []):
-                            self.table.cellWidget(r,0).layout().itemAt(0).widget().setChecked(True)
-                    self.start_selected(); self.add_log("System restored from last state.")
-            except: pass
+                        name = self.table.item(r, 1).text()
+                        if name in active_map:
+                            # Set Selected
+                            self.table.cellWidget(r, 0).layout().itemAt(0).widget().setChecked(True)
+                            # Set Recording Preference
+                            self.table.cellWidget(r, 2).layout().itemAt(0).widget().setChecked(active_map[name])
+                            
+                            # Auto Start
+                            url = self.channels_db[r]["url"]
+                            self.start_worker(name, url, conf, active_map[name])
+            except Exception as e: self.log(f"Restore Error: {e}")
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv); app.setStyle("Fusion"); win = IPTVHotelSuite(); win.show(); sys.exit(app.exec())
+    app = QApplication(sys.argv)
+    win = HotelDashboard()
+    win.show()
+    sys.exit(app.exec())
