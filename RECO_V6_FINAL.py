@@ -91,14 +91,18 @@ class StreamWorker(QObject):
             api = f"{base}/api.php"
             auth = f"username={c['user']}&password={c['pass']}"
             
-            # חיפוש קטגוריה
-            res = requests.get(f"{api}?action=get_categories&{auth}", timeout=5).json()
-            cat = next((x['category_id'] for x in res if x['category_name']=="Channels"), None)
+            # בדיקת קטגוריה
+            try:
+                res = requests.get(f"{api}?action=get_categories&{auth}", timeout=5).json()
+                cat = next((x['category_id'] for x in res if x['category_name']=="Channels"), None)
+            except: cat = None
             
             # יצירה אם לא קיים
             if not cat:
-                res = requests.post(f"{api}?action=add_category", data={**c, "category_name":"Channels", "category_type":"live"}).json()
-                cat = res.get('category_id', "1")
+                try:
+                    res = requests.post(f"{api}?action=add_category", data={**c, "category_name":"Channels", "category_type":"live"}).json()
+                    cat = res.get('category_id', "1")
+                except: cat = "1"
             
             # יצירת סטרים
             requests.post(f"{api}?action=add_stream", data={
@@ -123,6 +127,7 @@ class StreamWorker(QObject):
         except: pass
         
         while self.running:
+            # פקודת FFmpeg יציבה
             cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-stimeout', '5000000', '-i', self.url, '-c', 'copy', '-f', 'mpegts']
             tgts = []
             
@@ -142,7 +147,8 @@ class StreamWorker(QObject):
                     uptime = time.strftime("%H:%M:%S", time.gmtime(time.time() - start))
                     d_size = 0
                     if self.rec and os.path.exists(folder):
-                        d_size = sum(os.path.getsize(os.path.join(folder, f)) for f in os.listdir(folder)) / 1048576
+                        try: d_size = sum(os.path.getsize(os.path.join(folder, f)) for f in os.listdir(folder)) / 1048576
+                        except: pass
                     self.stats_signal.emit(self.name, {"status": "ACTIVE", "uptime": uptime, "disk": f"{d_size:.1f} MB", "link": xui or "N/A"})
                     time.sleep(3)
                 if self.running: time.sleep(5)
@@ -156,7 +162,7 @@ class StreamWorker(QObject):
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL MANAGER v12.0 (Ultimate Tools)")
+        self.setWindowTitle("X-HOTEL MANAGER v12.0 (Production)")
         self.resize(1600, 1000)
         self.workers = {}
         self.net_io = psutil.net_io_counters()
