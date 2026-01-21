@@ -13,27 +13,28 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["QT_QUICK_BACKEND"] = "software"
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18',
     'Accept': '*/*',
     'Connection': 'keep-alive'
 }
 
+# --- נסה לתקן את ה-CHAT ID אם יש לך חדש ---
 TELEGRAM_TOKEN = "8307008722:AAHY-QYNYyTnOwjS0q4VGfA0_iUiQBxYHBc"
-TELEGRAM_CHAT_ID = "-5125327073"
+TELEGRAM_CHAT_ID = "-5125327073" 
+
 CONFIG_FILE = "/root/iptv_config.json"
 RECORDINGS_PATH = "/root/Recordings"
-FIXED_PORTAL = "http://144.91.86.250/mbmWePBa"
+# ברירת מחדל נקייה יותר
+FIXED_PORTAL = "http://144.91.86.250" 
+LOG_FILE = "/root/ffmpeg_err.log"
 
 def send_telegram(msg, verbose=False):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, verify=False, timeout=10)
-        if verbose and resp.status_code != 200:
-            return f"Error {resp.status_code}: {resp.text}"
+        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, verify=False, timeout=5)
+        if verbose and resp.status_code != 200: return f"Error {resp.status_code}: {resp.text}"
         return "OK"
-    except Exception as e:
-        if verbose: return str(e)
-        return "Error"
+    except Exception as e: return str(e)
 
 # --- רכיבים גרפיים ---
 class ToolButton(QPushButton):
@@ -55,7 +56,7 @@ class ProGauge(QWidget):
         p.setPen(QColor("white")); p.setFont(QFont("Segoe UI",22,QFont.Weight.Bold)); p.drawText(rect,Qt.AlignmentFlag.AlignCenter,f"{self.value:.1f}{self.unit}")
         p.setPen(QColor("#a6accd")); p.setFont(QFont("Segoe UI",10)); p.drawText(int(w/2)-50,int(h)-30,100,20,Qt.AlignmentFlag.AlignCenter,self.title)
 
-# --- מנוע הקלטה Fail-Safe ---
+# --- מנוע הקלטה עם דיבוג חכם ---
 class RecordingWorker(QThread):
     stats_signal = pyqtSignal(str, dict)
     log_signal = pyqtSignal(str) 
@@ -80,41 +81,38 @@ class RecordingWorker(QThread):
             abs_output = os.path.abspath(output_file)
             
             xui_target = ""
-            # ניסיון חיבור לפאנל - אם נכשל, לא עוצרים!
+            # --- התיקון החכם: ניקוי הכתובת ---
             if self.iptv_config and self.iptv_config.get('server'):
                 try:
                     c = self.iptv_config
-                    clean_server = c['server'].split('/dashboard')[0].rstrip('/')
+                    # מנקה סיומות מיותרות מה-URL
+                    clean_server = c['server'].replace('/mbmWePBa', '').rstrip('/')
+                    
                     if c['user'] and c['pass']:
-                        # כאן אנחנו רק בונים את הלינק, הרישום ל-API נעשה בנפרד או ידנית
                         xui_target = f"{clean_server}/live/{c['user']}/{c['pass']}/{safe_name}.ts"
-                        
-                        # ניסיון "על הדרך" לרשום את הסטרים, אם נכשל - לא נורא
+                        # ניסיון רישום "שקט"
                         try:
-                            auth=f"username={c['user']}&password={c['pass']}"; api=f"{clean_server}/api.php"
+                            api=f"{clean_server}/api.php"
                             requests.post(f"{api}?action=add_stream", data={"username":c['user'],"password":c['pass'],"stream_display_name":self.channel_name,"stream_source":["127.0.0.1"],"category_id":"1","stream_mode":"live"}, verify=False, timeout=2)
                         except: pass
                 except: pass
 
-            # בניית הפקודה - אם יש XUI משתמשים ב-tee, אחרת רק Local
-            ua = HEADERS['User-Agent']
-            cmd = ['ffmpeg', '-y', '-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-headers', f'User-Agent: {ua}\r\n', '-i', self.url, '-c', 'copy']
+            cmd = ['ffmpeg', '-y', '-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-headers', f'User-Agent: {HEADERS["User-Agent"]}\r\n', '-i', self.url, '-c', 'copy']
 
             if xui_target:
-                # מצב משולב
                 tee_cmd = []
                 if self.record_local: tee_cmd.append(f"[f=mpegts]'{abs_output}'")
-                tee_cmd.append(f"[f=mpegts:onfail=ignore]{xui_target}") # onfail=ignore קריטי!
+                tee_cmd.append(f"[f=mpegts:onfail=ignore]{xui_target}")
                 cmd.extend(['-f', 'tee', "|".join(tee_cmd)])
             elif self.record_local:
-                # רק הקלטה
                 cmd.extend(['-f', 'mpegts', abs_output])
             else:
-                # כלום
                 cmd.extend(['-f', 'null', '-'])
 
             try:
-                self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                # שמירת לוג שגיאות לקובץ כדי שנוכל לקרוא אותו
+                with open(LOG_FILE, "w") as err:
+                    self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err)
                 
                 while self.process.poll() is None and self.is_running:
                     uptime = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time))
@@ -123,18 +121,20 @@ class RecordingWorker(QThread):
                          try: disk = f"{os.path.getsize(abs_output)/1048576:.1f} MB"
                          except: pass
                     
-                    link_status = "Local Only"
-                    if xui_target: link_status = "Pushing to Panel"
-                    
-                    self.stats_signal.emit(self.channel_name, {"status":"ACTIVE", "uptime":uptime, "disk":disk, "link":link_status})
+                    self.stats_signal.emit(self.channel_name, {"status":"ACTIVE", "uptime":uptime, "disk":disk, "link":"Pushing..." if xui_target else "Local"})
                     time.sleep(2)
                 
                 if self.is_running:
-                    self.log_signal.emit(f"⚠️ Stream {self.channel_name} dropped. Restarting...")
-                    time.sleep(2)
+                    # קריאת השגיאה האחרונה מהלוג
+                    try: 
+                        with open(LOG_FILE, 'r') as f: last_err = f.readlines()[-1].strip()
+                    except: last_err = "Unknown FFmpeg Error"
+                    
+                    self.log_signal.emit(f"⚠️ Crashed: {last_err}")
+                    time.sleep(3)
 
             except Exception as e:
-                self.log_signal.emit(f"Process Error: {e}")
+                self.log_signal.emit(f"Sys Error: {e}")
                 time.sleep(5)
 
     def stop(self):
@@ -148,13 +148,12 @@ class RecordingWorker(QThread):
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL v24.0 (Admin Panel)"); self.resize(1600, 1000)
+        self.setWindowTitle("X-HOTEL v25.0 (Auto-Fixer)"); self.resize(1600, 1000)
         self.workers={}; self.net_io=psutil.net_io_counters()
         self.setup_ui(); QTimer.singleShot(500, self.restore); self.t=QTimer(); self.t.timeout.connect(self.upd_stats); self.t.start(1000)
         
-        # הודעת בדיקה בעלייה
         res = send_telegram("✅ <b>SYSTEM ONLINE</b>", verbose=True)
-        if res != "OK": self.add_log(f"Telegram Init Failed: {res}")
+        if res != "OK": self.add_log(f"TG Init Error: {res}")
 
     def setup_ui(self):
         self.setStyleSheet("QMainWindow{background:#10121b;} QWidget{color:#e0e6ed;font-family:'Segoe UI';} QTabWidget::pane{border:0;background:#10121b;} QTabBar::tab{background:#1f2233;padding:12px 30px;margin:2px;border-radius:6px;font-weight:bold;} QTabBar::tab:selected{background:#00d4ff;color:black;} QLineEdit{background:#1f2233;border:1px solid #3b3f51;padding:10px;color:white;border-radius:6px;} QTableWidget{background:#151722;border:none;gridline-color:#2d303e;} QHeaderView::section{background:#1f2233;padding:8px;border:none;} QTextEdit{background:#0a0b10;color:#00e676;border-radius:8px;font-family:'Consolas';}")
@@ -163,14 +162,15 @@ class XHotelUI(QMainWindow):
         tabs=QTabWidget(); l.addWidget(tabs)
 
         t1=QWidget(); t1l=QVBoxLayout(t1); c_f=QFrame(); gl=QGridLayout(c_f); c_f.setStyleSheet("background:#1f2233;border-radius:12px;padding:10px;")
+        
+        # כתובת ברירת המחדל תהיה ה-IP הנקי
         self.url=QLineEdit(FIXED_PORTAL); self.usr=QLineEdit("admin"); self.pw=QLineEdit("MazalTovLanu"); self.m3u=QLineEdit(); self.m3u.setPlaceholderText("Paste M3U URL...")
         
-        gl.addWidget(QLabel("PORTAL"),0,0); gl.addWidget(self.url,0,1)
+        gl.addWidget(QLabel("PORTAL (IP ONLY)"),0,0); gl.addWidget(self.url,0,1)
         gl.addWidget(QLabel("USER"),0,2); gl.addWidget(self.usr,0,3)
         gl.addWidget(QLabel("PASS"),0,4); gl.addWidget(self.pw,0,5)
         
-        # --- הכפתור החדש ליצירת קטגוריה ---
-        btn_cat = QPushButton("CREATE CATEGORY"); btn_cat.setStyleSheet("background:#9c27b0;color:white;font-weight:bold;padding:10px;"); btn_cat.clicked.connect(self.create_category_manual)
+        btn_cat = QPushButton("CREATE CATEGORY & TEST"); btn_cat.setStyleSheet("background:#9c27b0;color:white;font-weight:bold;padding:10px;"); btn_cat.clicked.connect(self.create_category_manual)
         gl.addWidget(btn_cat, 1, 0, 1, 1)
         
         gl.addWidget(self.m3u,1,1,1,4); b=QPushButton("LOAD M3U"); b.setStyleSheet("background:#00d4ff;color:black;font-weight:bold;padding:10px;border-radius:6px;"); b.clicked.connect(self.load_m3u); gl.addWidget(b,1,5)
@@ -190,51 +190,48 @@ class XHotelUI(QMainWindow):
         btn_restart=ToolButton("RESTART APP","🛑","#00bcd4"); btn_restart.clicked.connect(self.tool_restart_app)
         t3l.addWidget(btn_test,0,0); t3l.addWidget(btn_clean,0,1); t3l.addWidget(btn_reboot,1,0); t3l.addWidget(btn_restart,1,1); t3l.addWidget(QLabel("Tools Area"),2,0,1,2,Qt.AlignmentFlag.AlignCenter); tabs.addTab(t3,"🛠️ TOOLS")
 
-    # --- פונקציית יצירת הקטגוריה הידנית ---
+    # --- יצירת קטגוריה עם תיקון URL אוטומטי ---
     def create_category_manual(self):
-        base = self.url.text().split('/dashboard')[0].rstrip('/')
+        # ניקוי הכתובת מתוספות מיותרות
+        base = self.url.text().replace('/mbmWePBa', '').rstrip('/')
         api = f"{base}/api.php"
         auth = f"username={self.usr.text()}&password={self.pw.text()}"
         
-        self.add_log(f"Trying to connect to Panel: {base}")
+        self.add_log(f"Attempting connect to: {api}")
         
         try:
-            # שלב 1: בדיקת חיבור
             res = requests.get(f"{api}?action=get_categories&{auth}", timeout=10, verify=False)
+            
+            # אם קיבלנו HTML במקום JSON - זה הסימן לכתובת לא נכונה
+            if "<html" in res.text.lower():
+                QMessageBox.critical(self, "Wrong URL", "Server returned HTML (Webpage) instead of JSON.\nTry removing '/mbmWePBa' from the URL.")
+                return
+
             if res.status_code != 200:
-                QMessageBox.critical(self, "Connection Failed", f"Status Code: {res.status_code}\nResponse: {res.text}")
+                QMessageBox.critical(self, "Error", f"HTTP Error: {res.status_code}")
                 return
             
-            # שלב 2: בדיקה אם קיים
-            cats = res.json()
-            exists = any(c['category_name'] == "Channels" for c in cats)
-            
-            if exists:
-                QMessageBox.information(self, "Info", "Category 'Channels' already exists!")
-                self.add_log("Category already exists.")
+            try:
+                cats = res.json()
+            except:
+                QMessageBox.critical(self, "JSON Error", f"Could not parse response:\n{res.text[:100]}...")
+                return
+
+            if any(c.get('category_name') == "Channels" for c in cats):
+                QMessageBox.information(self, "OK", "Category 'Channels' exists! Connection Valid.")
+                self.add_log("Connection Verified.")
             else:
-                # שלב 3: יצירה
-                create_res = requests.post(f"{api}?action=add_category", data={
-                    "username": self.usr.text(),
-                    "password": self.pw.text(),
-                    "category_name": "Channels",
-                    "category_type": "live"
-                }, verify=False, timeout=10)
-                
-                if create_res.status_code == 200:
-                    QMessageBox.information(self, "Success", "Category 'Channels' created successfully!")
-                    self.add_log("Category created successfully.")
-                else:
-                    QMessageBox.critical(self, "Error", f"Failed to create category.\n{create_res.text}")
+                requests.post(f"{api}?action=add_category", data={"username": self.usr.text(), "password": self.pw.text(), "category_name": "Channels", "category_type": "live"}, verify=False)
+                QMessageBox.information(self, "Success", "Created 'Channels' category.")
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Connection Error:\n{str(e)}")
-            self.add_log(f"Category Error: {str(e)}")
+            QMessageBox.critical(self, "Error", str(e))
+            self.add_log(f"Conn Error: {str(e)}")
 
     def tool_test_tg(self): 
         res = send_telegram("🔔 <b>TEST</b> OK", verbose=True)
         if res == "OK": QMessageBox.information(self,"Success","Message Sent!")
-        else: QMessageBox.critical(self, "Telegram Error", f"Failed to send:\n{res}")
+        else: QMessageBox.critical(self, "Telegram Error", f"Failed:\n{res}")
 
     def tool_clean_disk(self): os.system("/root/clean_recordings.sh") if QMessageBox.question(self,'C',"Sure?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes else None
     def tool_reboot(self): os.system("reboot") if QMessageBox.question(self,'R',"Sure?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes else None
