@@ -13,7 +13,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["QT_QUICK_BACKEND"] = "software"
 
 HEADERS = {
-    'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
     'Accept': '*/*',
     'Connection': 'keep-alive'
 }
@@ -22,7 +22,7 @@ TELEGRAM_TOKEN = "8307008722:AAHY-QYNYyTnOwjS0q4VGfA0_iUiQBxYHBc"
 TELEGRAM_CHAT_ID = "-5125327073" 
 CONFIG_FILE = "/root/iptv_config.json"
 RECORDINGS_PATH = "/root/Recordings"
-DEFAULT_IP = "144.91.86.250" # כתובת IP בלבד
+DEFAULT_IP = "144.91.86.250"
 
 def send_telegram(msg, verbose=False):
     try:
@@ -77,30 +77,30 @@ class RecordingWorker(QThread):
             abs_output = os.path.abspath(output_file)
             
             xui_target = ""
-            # בניית כתובת מדויקת לפי הפורט וה-ID שהמשתמש הזין
-            if self.iptv_config.get('ip') and self.iptv_config.get('port'):
+            c = self.iptv_config
+            if c.get('ip') and c.get('port') and c.get('api_path'):
                 try:
-                    c = self.iptv_config
+                    # שימוש בנתיב המותאם אישית
                     base_url = f"http://{c['ip']}:{c['port']}"
+                    # חשוב: כאן אנחנו משתמשים בנתיב החדש
+                    api_endpoint = f"{base_url}{c['api_path']}"
                     
                     if c['user'] and c['pass']:
                         xui_target = f"{base_url}/live/{c['user']}/{c['pass']}/{safe_name}.ts"
                         try:
-                            # רישום ל-API עם הפורט הנכון ו-ID ידני
-                            api=f"{base_url}/api.php"
-                            requests.post(f"{api}?action=add_stream", data={
+                            # רישום ל-API בנתיב הנכון
+                            requests.post(f"{api_endpoint}?action=add_stream", data={
                                 "username":c['user'],
                                 "password":c['pass'],
                                 "stream_display_name":self.channel_name,
                                 "stream_source":["127.0.0.1"],
-                                "category_id":c.get('cat_id', '1'), # שימוש ב-ID הידני
+                                "category_id":c.get('cat_id', '1'),
                                 "stream_mode":"live"
-                            }, verify=False, timeout=2)
+                            }, verify=False, timeout=5)
                         except: pass
                 except: pass
 
             ua = HEADERS['User-Agent']
-            # הפקודה המנצחת
             cmd = ['ffmpeg', '-y', '-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-headers', f'User-Agent: {ua}\r\n', '-i', self.url, '-c', 'copy']
 
             if xui_target:
@@ -123,7 +123,7 @@ class RecordingWorker(QThread):
                          except: pass
                     
                     link_txt = "Local"
-                    if xui_target: link_txt = f"Panel :{c['port']}"
+                    if xui_target: link_txt = f"Panel ({c['port']})"
                     
                     self.stats_signal.emit(self.channel_name, {"status":"ACTIVE", "uptime":uptime, "disk":disk, "link":link_txt})
                     time.sleep(2)
@@ -146,7 +146,7 @@ class RecordingWorker(QThread):
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL v27.0 (Manual Override)"); self.resize(1600, 1000)
+        self.setWindowTitle("X-HOTEL v29.0 (Custom Path)"); self.resize(1600, 1000)
         self.workers={}; self.net_io=psutil.net_io_counters()
         self.setup_ui(); QTimer.singleShot(500, self.restore); self.t=QTimer(); self.t.timeout.connect(self.upd_stats); self.t.start(1000)
         
@@ -161,25 +161,28 @@ class XHotelUI(QMainWindow):
 
         t1=QWidget(); t1l=QVBoxLayout(t1); c_f=QFrame(); gl=QGridLayout(c_f); c_f.setStyleSheet("background:#1f2233;border-radius:12px;padding:10px;")
         
-        # --- שדות חדשים: IP, Port, Cat ID ---
+        # --- שדות חדשים כולל API PATH ---
         self.ip=QLineEdit(DEFAULT_IP); self.port=QLineEdit("80"); self.port.setPlaceholderText("Port")
+        self.api_path=QLineEdit("/mbmWePBa/api"); self.api_path.setPlaceholderText("API Path (e.g. /api.php)")
+        
         self.usr=QLineEdit("admin"); self.pw=QLineEdit("MazalTovLanu")
         self.cat_id=QSpinBox(); self.cat_id.setValue(1); self.cat_id.setPrefix("Cat ID: ")
         
         self.m3u=QLineEdit(); self.m3u.setPlaceholderText("Paste M3U URL...")
         
         gl.addWidget(QLabel("SERVER IP"),0,0); gl.addWidget(self.ip,0,1)
-        gl.addWidget(QLabel("PORT (Example: 8080)"),0,2); gl.addWidget(self.port,0,3)
-        gl.addWidget(QLabel("CATEGORY ID"),0,4); gl.addWidget(self.cat_id,0,5)
+        gl.addWidget(QLabel("PORT"),0,2); gl.addWidget(self.port,0,3)
+        gl.addWidget(QLabel("API PATH"),0,4); gl.addWidget(self.api_path,0,5)
         
         gl.addWidget(QLabel("USER"),1,0); gl.addWidget(self.usr,1,1)
         gl.addWidget(QLabel("PASS"),1,2); gl.addWidget(self.pw,1,3)
+        gl.addWidget(QLabel("CATEGORY ID"),1,4); gl.addWidget(self.cat_id,1,5)
         
-        # כפתור בדיקה ממוקד
+        # כפתור בדיקה
         btn_check = QPushButton("CHECK CONNECTION"); btn_check.setStyleSheet("background:#e91e63;color:white;font-weight:bold;padding:10px;"); btn_check.clicked.connect(self.check_connection)
-        gl.addWidget(btn_check, 1, 4, 1, 2)
+        gl.addWidget(btn_check, 2, 4, 1, 2)
         
-        gl.addWidget(self.m3u,2,1,1,4); b=QPushButton("LOAD M3U"); b.setStyleSheet("background:#00d4ff;color:black;font-weight:bold;padding:10px;border-radius:6px;"); b.clicked.connect(self.load_m3u); gl.addWidget(b,2,5)
+        gl.addWidget(self.m3u,2,1,1,3); b=QPushButton("LOAD M3U"); b.setStyleSheet("background:#00d4ff;color:black;font-weight:bold;padding:10px;border-radius:6px;"); b.clicked.connect(self.load_m3u); gl.addWidget(b,2,0)
         t1l.addWidget(c_f)
         
         self.tbl=QTableWidget(0,7); self.tbl.setHorizontalHeaderLabels(["SEL","CHANNEL","REC","STATUS","UPTIME","DISK","ACTION"]); self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch); t1l.addWidget(self.tbl)
@@ -196,21 +199,29 @@ class XHotelUI(QMainWindow):
         btn_restart=ToolButton("RESTART APP","🛑","#00bcd4"); btn_restart.clicked.connect(self.tool_restart_app)
         t3l.addWidget(btn_test,0,0); t3l.addWidget(btn_clean,0,1); t3l.addWidget(btn_reboot,1,0); t3l.addWidget(btn_restart,1,1); t3l.addWidget(QLabel("Tools Area"),2,0,1,2,Qt.AlignmentFlag.AlignCenter); tabs.addTab(t3,"🛠️ TOOLS")
 
-    # --- פונקציית בדיקה ידנית ---
     def check_connection(self):
-        url = f"http://{self.ip.text()}:{self.port.text()}/api.php"
+        # בניית הכתובת לפי הפורמט החדש
+        url = f"http://{self.ip.text()}:{self.port.text()}{self.api_path.text()}"
         auth = f"username={self.usr.text()}&password={self.pw.text()}"
         self.add_log(f"Testing: {url}...")
         
         try:
-            res = requests.get(f"{url}?action=get_categories&{auth}", timeout=5, verify=False)
-            if res.status_code == 200 and "category_id" in res.text:
-                QMessageBox.information(self, "Success", "Connection Established!\nAPI is working.")
-                self.add_log("API Connection Success.")
-            elif "<html" in res.text.lower():
-                QMessageBox.warning(self, "Wrong Port", "Server returned HTML.\nThis is likely the Admin Panel port.\nTry port 8080, 25461, or 8000.")
+            res = requests.get(f"{url}?action=get_categories&{auth}", timeout=8, verify=False)
+            
+            if res.status_code == 200:
+                # בדיקה אם קיבלנו JSON
+                try:
+                    data = res.json()
+                    QMessageBox.information(self, "Success", "Connection & API Verified!")
+                    self.add_log("API OK: JSON Response received.")
+                except:
+                    # אם זה לא JSON, אולי זה עדיין יעבוד בגלל המבנה
+                    self.add_log(f"Response: {res.text[:100]}")
+                    QMessageBox.warning(self, "Check", "Got 200 OK, but response wasn't clean JSON.\nCheck logs.")
+            elif res.status_code == 404:
+                QMessageBox.critical(self, "Error", "404 Not Found.\nThe API Path is incorrect.")
             else:
-                QMessageBox.warning(self, "Error", f"Failed. Status: {res.status_code}")
+                QMessageBox.critical(self, "Error", f"Failed. Status: {res.status_code}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Connection Failed:\n{e}")
 
@@ -257,10 +268,10 @@ class XHotelUI(QMainWindow):
         self.add_log(f"Loaded {count} channels.")
 
     def start_sel(self):
-        # איסוף הנתונים מהשדות החדשים
         cf={
             "ip":self.ip.text(),
             "port":self.port.text(),
+            "api_path":self.api_path.text(),
             "user":self.usr.text(),
             "pass":self.pw.text(),
             "cat_id":str(self.cat_id.value())
@@ -293,13 +304,21 @@ class XHotelUI(QMainWindow):
         self.workers.clear(); self.add_log("Stopped All")
         for r in range(self.tbl.rowCount()): self.tbl.item(r,3).setText("STOPPED"); self.tbl.item(r,3).setForeground(QColor("red"))
 
-    def save(self): act=[{"name":n,"rec":w.record_local} for n,w in self.workers.items()]; json.dump({"ip":self.ip.text(),"port":self.port.text(),"user":self.usr.text(),"pass":self.pw.text(),"m3u":self.m3u.text(),"act":act}, open(CONFIG_FILE,"w"))
+    def save(self): 
+        act=[{"name":n,"rec":w.record_local} for n,w in self.workers.items()]
+        data = {
+            "ip":self.ip.text(), "port":self.port.text(), "api_path":self.api_path.text(),
+            "user":self.usr.text(), "pass":self.pw.text(), "m3u":self.m3u.text(), "act":act
+        }
+        json.dump(data, open(CONFIG_FILE,"w"))
+        
     def restore(self):
         if os.path.exists(CONFIG_FILE):
             try:
                 s=json.load(open(CONFIG_FILE))
                 self.ip.setText(s.get("ip", DEFAULT_IP))
                 self.port.setText(s.get("port", "80"))
+                self.api_path.setText(s.get("api_path", "/mbmWePBa/api"))
                 self.usr.setText(s.get("user",""))
                 self.pw.setText(s.get("pass",""))
                 self.m3u.setText(s.get("m3u",""))
