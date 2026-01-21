@@ -75,7 +75,10 @@ class RecordingWorker(QObject):
                 while self.process.poll() is None and self.is_running:
                     uptime = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time))
                     size = 0
-                    for f in os.listdir(channel_path): size += os.path.getsize(os.path.join(channel_path, f))
+                    if os.path.exists(channel_path):
+                        for f in os.listdir(channel_path): 
+                            fp = os.path.join(channel_path, f)
+                            if os.path.isfile(fp): size += os.path.getsize(fp)
                     self.status_changed.emit(self.channel_name, {"status": "Active", "uptime": uptime, "size": f"{size/(1024*1024):.1f}MB", "link": broadcast_link})
                     time.sleep(5)
                 if self.is_running: time.sleep(10)
@@ -88,10 +91,11 @@ class RecordingWorker(QObject):
 class IPTVHotelSuite(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Hotel IPTV Pro Dashboard v9.0")
-        self.resize(1400, 850)
+        self.setWindowTitle("Hotel IPTV Ultimate Dashboard v9.5")
+        self.resize(1400, 900)
         self.active_workers = {}
         self.output_folder = "/root/Recordings"
+        self.last_net_io = psutil.net_io_counters()
         self.init_ui()
         QTimer.singleShot(1000, self.auto_load_last_state)
 
@@ -121,8 +125,8 @@ class IPTVHotelSuite(QMainWindow):
         layout.addWidget(self.table)
         
         btns = QHBoxLayout()
-        btn_start = QPushButton("START SELECTED"); btn_start.clicked.connect(self.start_selected)
-        btn_stop_all = QPushButton("STOP ALL"); btn_stop_all.clicked.connect(self.stop_all)
+        btn_start = QPushButton("🚀 START SELECTED"); btn_start.clicked.connect(self.start_selected)
+        btn_stop_all = QPushButton("🛑 STOP ALL"); btn_stop_all.clicked.connect(self.stop_all)
         btns.addWidget(btn_start); btns.addWidget(btn_stop_all); layout.addLayout(btns)
         
         self.tabs.addTab(self.control_tab, "Live Control")
@@ -130,28 +134,49 @@ class IPTVHotelSuite(QMainWindow):
         # --- לשונית אנליטיקה (Analytics) ---
         self.analytics_tab = QWidget()
         a_layout = QVBoxLayout(self.analytics_tab)
-        self.a_table = QTableWidget(0, 4)
-        self.a_table.setHorizontalHeaderLabels(["Name", "Uptime", "Disk Usage", "System Impact"])
+        
+        # Network Speed Indicators
+        net_f = QFrame(); net_l = QHBoxLayout(net_f)
+        self.net_in_lbl = QLabel("Download: 0 KB/s"); self.net_out_lbl = QLabel("Upload: 0 KB/s")
+        self.net_in_lbl.setStyleSheet("color: #00ff00; font-weight: bold; font-size: 16px;")
+        self.net_out_lbl.setStyleSheet("color: #00ffff; font-weight: bold; font-size: 16px;")
+        net_l.addWidget(self.net_in_lbl); net_l.addWidget(self.net_out_lbl)
+        a_layout.addWidget(net_f)
+
+        self.a_table = QTableWidget(0, 3)
+        self.a_table.setHorizontalHeaderLabels(["Name", "Uptime", "Disk Usage"])
         self.a_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         a_layout.addWidget(self.a_table)
         
         self.cpu_bar = QProgressBar(); self.ram_bar = QProgressBar()
-        a_layout.addWidget(QLabel("Overall CPU Usage:")); a_layout.addWidget(self.cpu_bar)
-        a_layout.addWidget(QLabel("Overall RAM Usage:")); a_layout.addWidget(self.ram_bar)
+        a_layout.addWidget(QLabel("CPU Load:")); a_layout.addWidget(self.cpu_bar)
+        a_layout.addWidget(QLabel("Memory Usage:")); a_layout.addWidget(self.ram_bar)
         self.tabs.addTab(self.analytics_tab, "System Analytics")
         
-        self.sys_timer = QTimer(); self.sys_timer.timeout.connect(self.update_sys); self.sys_timer.start(3000)
+        self.sys_timer = QTimer(); self.sys_timer.timeout.connect(self.update_stats); self.sys_timer.start(2000)
 
-    def update_sys(self):
+    def update_stats(self):
+        # Update CPU/RAM
         self.cpu_bar.setValue(int(psutil.cpu_percent()))
         self.ram_bar.setValue(int(psutil.virtual_memory().percent))
+        
+        # Update Network Speed
+        new_net_io = psutil.net_io_counters()
+        in_speed = (new_net_io.bytes_recv - self.last_net_io.bytes_recv) / 2048 # KB/s
+        out_speed = (new_net_io.bytes_sent - self.last_net_io.bytes_sent) / 2048 # KB/s
+        self.net_in_lbl.setText(f"Download: {in_speed:.1f} KB/s")
+        self.net_out_lbl.setText(f"Upload: {out_speed:.1f} KB/s")
+        self.last_net_io = new_net_io
 
     def load_playlist(self):
         try:
             res = requests.get(self.m3u_i.text(), timeout=10)
             self.channels_data = []
+            name = "Cam"
             for line in res.text.splitlines():
-                if line.startswith("#EXTINF"): name = re.search(r',([^,]+)$', line).group(1)
+                if line.startswith("#EXTINF"): 
+                    match = re.search(r',([^,]+)$', line)
+                    name = match.group(1).strip() if match else "Cam"
                 elif line.startswith("http"): self.channels_data.append({'name': name, 'url': line})
             self.refresh_tables()
         except: pass
@@ -171,11 +196,13 @@ class IPTVHotelSuite(QMainWindow):
     def start_selected(self):
         conf = {'server': self.server_i.text(), 'user': self.user_i.text(), 'pass': self.pass_i.text()}
         for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r,0).layout().itemAt(0).widget().isChecked():
-                name = self.table.item(r,1).text()
+            chk_widget = self.table.cellWidget(r, 0)
+            if chk_widget and chk_widget.layout().itemAt(0).widget().isChecked():
+                name = self.table.item(r, 1).text()
                 if name not in self.active_workers:
                     worker = RecordingWorker(name, self.channels_data[r]['url'], self.output_folder, conf)
-                    worker.status_changed.connect(self.update_ui); threading.Thread(target=worker.start_recording, daemon=True).start()
+                    worker.status_changed.connect(self.update_ui)
+                    threading.Thread(target=worker.start_recording, daemon=True).start()
                     self.active_workers[name] = worker
         self.save_state()
 
@@ -191,7 +218,7 @@ class IPTVHotelSuite(QMainWindow):
             send_telegram_msg(f"🛑 <b>הקלטה הופסקה</b>\nערוץ: {name}")
 
     def stop_all(self):
-        for w in self.active_workers.values(): w.stop()
+        for w in list(self.active_workers.values()): w.stop()
         self.active_workers.clear()
 
     def save_state(self):
@@ -200,12 +227,15 @@ class IPTVHotelSuite(QMainWindow):
 
     def auto_load_last_state(self):
         if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                s = json.load(f); self.m3u_i.setText(s.get("m3u","")); self.load_playlist()
-                for r in range(self.table.rowCount()):
-                    if self.table.item(r,1).text() in s.get("active", []):
-                        self.table.cellWidget(r,0).layout().itemAt(0).widget().setChecked(True)
-                self.start_selected()
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    s = json.load(f); self.m3u_i.setText(s.get("m3u","")); self.load_playlist()
+                    for r in range(self.table.rowCount()):
+                        if self.table.item(r,1).text() in s.get("active", []):
+                            chk_widget = self.table.cellWidget(r,0)
+                            if chk_widget: chk_widget.layout().itemAt(0).widget().setChecked(True)
+                    self.start_selected()
+            except: pass
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv); win = IPTVHotelSuite(); win.show(); sys.exit(app.exec())
+    app = QApplication(sys.argv); app.setStyle("Fusion"); win = IPTVHotelSuite(); win.show(); sys.exit(app.exec())
