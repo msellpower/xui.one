@@ -18,15 +18,11 @@ HEADERS = {
     'Connection': 'keep-alive'
 }
 
-# --- נסה לתקן את ה-CHAT ID אם יש לך חדש ---
 TELEGRAM_TOKEN = "8307008722:AAHY-QYNYyTnOwjS0q4VGfA0_iUiQBxYHBc"
 TELEGRAM_CHAT_ID = "-5125327073" 
-
 CONFIG_FILE = "/root/iptv_config.json"
 RECORDINGS_PATH = "/root/Recordings"
-# ברירת מחדל נקייה יותר
-FIXED_PORTAL = "http://144.91.86.250" 
-LOG_FILE = "/root/ffmpeg_err.log"
+FIXED_IP = "http://144.91.86.250" # כתובת בסיס ללא פורט
 
 def send_telegram(msg, verbose=False):
     try:
@@ -56,7 +52,7 @@ class ProGauge(QWidget):
         p.setPen(QColor("white")); p.setFont(QFont("Segoe UI",22,QFont.Weight.Bold)); p.drawText(rect,Qt.AlignmentFlag.AlignCenter,f"{self.value:.1f}{self.unit}")
         p.setPen(QColor("#a6accd")); p.setFont(QFont("Segoe UI",10)); p.drawText(int(w/2)-50,int(h)-30,100,20,Qt.AlignmentFlag.AlignCenter,self.title)
 
-# --- מנוע הקלטה עם דיבוג חכם ---
+# --- מנוע הקלטה ---
 class RecordingWorker(QThread):
     stats_signal = pyqtSignal(str, dict)
     log_signal = pyqtSignal(str) 
@@ -81,23 +77,21 @@ class RecordingWorker(QThread):
             abs_output = os.path.abspath(output_file)
             
             xui_target = ""
-            # --- התיקון החכם: ניקוי הכתובת ---
             if self.iptv_config and self.iptv_config.get('server'):
                 try:
                     c = self.iptv_config
-                    # מנקה סיומות מיותרות מה-URL
-                    clean_server = c['server'].replace('/mbmWePBa', '').rstrip('/')
-                    
+                    # שימוש בכתובת המלאה כולל פורט שהמשתמש מצא
+                    server_url = c['server'].rstrip('/')
                     if c['user'] and c['pass']:
-                        xui_target = f"{clean_server}/live/{c['user']}/{c['pass']}/{safe_name}.ts"
-                        # ניסיון רישום "שקט"
+                        xui_target = f"{server_url}/live/{c['user']}/{c['pass']}/{safe_name}.ts"
                         try:
-                            api=f"{clean_server}/api.php"
+                            api=f"{server_url}/api.php"
                             requests.post(f"{api}?action=add_stream", data={"username":c['user'],"password":c['pass'],"stream_display_name":self.channel_name,"stream_source":["127.0.0.1"],"category_id":"1","stream_mode":"live"}, verify=False, timeout=2)
                         except: pass
                 except: pass
 
-            cmd = ['ffmpeg', '-y', '-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-headers', f'User-Agent: {HEADERS["User-Agent"]}\r\n', '-i', self.url, '-c', 'copy']
+            ua = HEADERS['User-Agent']
+            cmd = ['ffmpeg', '-y', '-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-headers', f'User-Agent: {ua}\r\n', '-i', self.url, '-c', 'copy']
 
             if xui_target:
                 tee_cmd = []
@@ -110,31 +104,20 @@ class RecordingWorker(QThread):
                 cmd.extend(['-f', 'null', '-'])
 
             try:
-                # שמירת לוג שגיאות לקובץ כדי שנוכל לקרוא אותו
-                with open(LOG_FILE, "w") as err:
-                    self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err)
-                
+                self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 while self.process.poll() is None and self.is_running:
                     uptime = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time))
                     disk = "0.0 MB"
                     if self.record_local and os.path.exists(abs_output):
                          try: disk = f"{os.path.getsize(abs_output)/1048576:.1f} MB"
                          except: pass
-                    
                     self.stats_signal.emit(self.channel_name, {"status":"ACTIVE", "uptime":uptime, "disk":disk, "link":"Pushing..." if xui_target else "Local"})
                     time.sleep(2)
-                
                 if self.is_running:
-                    # קריאת השגיאה האחרונה מהלוג
-                    try: 
-                        with open(LOG_FILE, 'r') as f: last_err = f.readlines()[-1].strip()
-                    except: last_err = "Unknown FFmpeg Error"
-                    
-                    self.log_signal.emit(f"⚠️ Crashed: {last_err}")
-                    time.sleep(3)
-
+                    self.log_signal.emit(f"⚠️ Stream {self.channel_name} dropped. Restarting...")
+                    time.sleep(2)
             except Exception as e:
-                self.log_signal.emit(f"Sys Error: {e}")
+                self.log_signal.emit(f"Process Error: {e}")
                 time.sleep(5)
 
     def stop(self):
@@ -148,10 +131,9 @@ class RecordingWorker(QThread):
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL v25.0 (Auto-Fixer)"); self.resize(1600, 1000)
+        self.setWindowTitle("X-HOTEL v26.0 (Port Scanner)"); self.resize(1600, 1000)
         self.workers={}; self.net_io=psutil.net_io_counters()
         self.setup_ui(); QTimer.singleShot(500, self.restore); self.t=QTimer(); self.t.timeout.connect(self.upd_stats); self.t.start(1000)
-        
         res = send_telegram("✅ <b>SYSTEM ONLINE</b>", verbose=True)
         if res != "OK": self.add_log(f"TG Init Error: {res}")
 
@@ -163,15 +145,15 @@ class XHotelUI(QMainWindow):
 
         t1=QWidget(); t1l=QVBoxLayout(t1); c_f=QFrame(); gl=QGridLayout(c_f); c_f.setStyleSheet("background:#1f2233;border-radius:12px;padding:10px;")
         
-        # כתובת ברירת המחדל תהיה ה-IP הנקי
-        self.url=QLineEdit(FIXED_PORTAL); self.usr=QLineEdit("admin"); self.pw=QLineEdit("MazalTovLanu"); self.m3u=QLineEdit(); self.m3u.setPlaceholderText("Paste M3U URL...")
+        self.url=QLineEdit(FIXED_IP); self.usr=QLineEdit("admin"); self.pw=QLineEdit("MazalTovLanu"); self.m3u=QLineEdit(); self.m3u.setPlaceholderText("Paste M3U URL...")
         
-        gl.addWidget(QLabel("PORTAL (IP ONLY)"),0,0); gl.addWidget(self.url,0,1)
+        gl.addWidget(QLabel("PORTAL (http://IP:PORT)"),0,0); gl.addWidget(self.url,0,1)
         gl.addWidget(QLabel("USER"),0,2); gl.addWidget(self.usr,0,3)
         gl.addWidget(QLabel("PASS"),0,4); gl.addWidget(self.pw,0,5)
         
-        btn_cat = QPushButton("CREATE CATEGORY & TEST"); btn_cat.setStyleSheet("background:#9c27b0;color:white;font-weight:bold;padding:10px;"); btn_cat.clicked.connect(self.create_category_manual)
-        gl.addWidget(btn_cat, 1, 0, 1, 1)
+        # --- סורק הפורטים ---
+        btn_scan = QPushButton("AUTO DETECT PORT"); btn_scan.setStyleSheet("background:#e91e63;color:white;font-weight:bold;padding:10px;"); btn_scan.clicked.connect(self.auto_detect_port)
+        gl.addWidget(btn_scan, 1, 0, 1, 1)
         
         gl.addWidget(self.m3u,1,1,1,4); b=QPushButton("LOAD M3U"); b.setStyleSheet("background:#00d4ff;color:black;font-weight:bold;padding:10px;border-radius:6px;"); b.clicked.connect(self.load_m3u); gl.addWidget(b,1,5)
         t1l.addWidget(c_f)
@@ -190,43 +172,37 @@ class XHotelUI(QMainWindow):
         btn_restart=ToolButton("RESTART APP","🛑","#00bcd4"); btn_restart.clicked.connect(self.tool_restart_app)
         t3l.addWidget(btn_test,0,0); t3l.addWidget(btn_clean,0,1); t3l.addWidget(btn_reboot,1,0); t3l.addWidget(btn_restart,1,1); t3l.addWidget(QLabel("Tools Area"),2,0,1,2,Qt.AlignmentFlag.AlignCenter); tabs.addTab(t3,"🛠️ TOOLS")
 
-    # --- יצירת קטגוריה עם תיקון URL אוטומטי ---
-    def create_category_manual(self):
-        # ניקוי הכתובת מתוספות מיותרות
-        base = self.url.text().replace('/mbmWePBa', '').rstrip('/')
-        api = f"{base}/api.php"
+    # --- פונקציית סריקת פורטים ---
+    def auto_detect_port(self):
+        base_ip = FIXED_IP.replace("http://", "").split(":")[0] # חילוץ IP נקי
+        ports_to_try = ["80", "8080", "8000", "25461", "8880", "25500", "8081"]
         auth = f"username={self.usr.text()}&password={self.pw.text()}"
         
-        self.add_log(f"Attempting connect to: {api}")
+        self.add_log(f"Scanning ports on {base_ip}...")
+        QMessageBox.information(self, "Scanning", "Scanning common Xtream ports.\nCheck logs for results.")
         
-        try:
-            res = requests.get(f"{api}?action=get_categories&{auth}", timeout=10, verify=False)
-            
-            # אם קיבלנו HTML במקום JSON - זה הסימן לכתובת לא נכונה
-            if "<html" in res.text.lower():
-                QMessageBox.critical(self, "Wrong URL", "Server returned HTML (Webpage) instead of JSON.\nTry removing '/mbmWePBa' from the URL.")
-                return
-
-            if res.status_code != 200:
-                QMessageBox.critical(self, "Error", f"HTTP Error: {res.status_code}")
-                return
-            
+        found = False
+        for port in ports_to_try:
+            url = f"http://{base_ip}:{port}/api.php?action=get_categories&{auth}"
             try:
-                cats = res.json()
+                self.add_log(f"Trying port {port}...")
+                res = requests.get(url, timeout=3, verify=False)
+                
+                # אם קיבלנו JSON תקין - זה הפורט!
+                if res.status_code == 200 and "category_id" in res.text:
+                    self.add_log(f"SUCCESS! Found API on port {port}")
+                    self.url.setText(f"http://{base_ip}:{port}")
+                    QMessageBox.information(self, "Success", f"Found API on port {port}!\nURL Updated.")
+                    found = True
+                    break
+                elif res.status_code == 200:
+                    self.add_log(f"Port {port} responded but content unknown: {res.text[:50]}")
             except:
-                QMessageBox.critical(self, "JSON Error", f"Could not parse response:\n{res.text[:100]}...")
-                return
-
-            if any(c.get('category_name') == "Channels" for c in cats):
-                QMessageBox.information(self, "OK", "Category 'Channels' exists! Connection Valid.")
-                self.add_log("Connection Verified.")
-            else:
-                requests.post(f"{api}?action=add_category", data={"username": self.usr.text(), "password": self.pw.text(), "category_name": "Channels", "category_type": "live"}, verify=False)
-                QMessageBox.information(self, "Success", "Created 'Channels' category.")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-            self.add_log(f"Conn Error: {str(e)}")
+                pass
+        
+        if not found:
+            QMessageBox.warning(self, "Failed", "Could not find open API port.\nCheck server firewall/whitelist.")
+            self.add_log("Scan finished. No ports found.")
 
     def tool_test_tg(self): 
         res = send_telegram("🔔 <b>TEST</b> OK", verbose=True)
@@ -304,7 +280,7 @@ class XHotelUI(QMainWindow):
     def restore(self):
         if os.path.exists(CONFIG_FILE):
             try:
-                s=json.load(open(CONFIG_FILE)); u = s.get("url",""); self.url.setText(u if u else FIXED_PORTAL)
+                s=json.load(open(CONFIG_FILE)); u = s.get("url",""); self.url.setText(u if u else FIXED_IP)
                 self.usr.setText(s.get("user","")); self.pw.setText(s.get("pass","")); self.m3u.setText(s.get("m3u",""))
                 if s.get("m3u"): 
                     self.load_m3u(); act={x['name']:x['rec'] for x in s.get('act',[])}
