@@ -12,7 +12,6 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QFont
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["QT_QUICK_BACKEND"] = "software"
 
-# Headers מהקוד שעבד לך
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': '*/*',
@@ -25,9 +24,16 @@ CONFIG_FILE = "/root/iptv_config.json"
 RECORDINGS_PATH = "/root/Recordings"
 FIXED_PORTAL = "http://144.91.86.250/mbmWePBa"
 
-def send_telegram(msg):
-    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, verify=False, timeout=5)
-    except: pass
+def send_telegram(msg, verbose=False):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, verify=False, timeout=10)
+        if verbose and resp.status_code != 200:
+            return f"Error {resp.status_code}: {resp.text}"
+        return "OK"
+    except Exception as e:
+        if verbose: return str(e)
+        return "Error"
 
 # --- רכיבים גרפיים ---
 class ToolButton(QPushButton):
@@ -49,26 +55,21 @@ class ProGauge(QWidget):
         p.setPen(QColor("white")); p.setFont(QFont("Segoe UI",22,QFont.Weight.Bold)); p.drawText(rect,Qt.AlignmentFlag.AlignCenter,f"{self.value:.1f}{self.unit}")
         p.setPen(QColor("#a6accd")); p.setFont(QFont("Segoe UI",10)); p.drawText(int(w/2)-50,int(h)-30,100,20,Qt.AlignmentFlag.AlignCenter,self.title)
 
-# --- המנוע המשוחזר (Worker) ---
+# --- מנוע הקלטה Fail-Safe ---
 class RecordingWorker(QThread):
     stats_signal = pyqtSignal(str, dict)
     log_signal = pyqtSignal(str) 
+    finished_signal = pyqtSignal(str)
 
     def __init__(self, name, url, config, record_local):
         super().__init__()
-        self.channel_name = name
-        self.url = url
-        self.iptv_config = config
-        self.record_local = record_local
+        self.channel_name = name; self.url = url; self.iptv_config = config; self.record_local = record_local
         self.is_running = True
-        self.process = None
 
     def run(self):
-        # 1. יצירת תיקייה (חובה!)
         safe_name = re.sub(r'[\\/*?:"<>|]', "", self.channel_name).strip().replace(" ", "_")
         channel_path = os.path.join(RECORDINGS_PATH, safe_name)
-        if self.record_local:
-            os.makedirs(channel_path, exist_ok=True)
+        if self.record_local: os.makedirs(channel_path, exist_ok=True)
 
         send_telegram(f"🎬 <b>STARTED:</b> {self.channel_name}")
         start_time = time.time()
@@ -79,77 +80,59 @@ class RecordingWorker(QThread):
             abs_output = os.path.abspath(output_file)
             
             xui_target = ""
-            has_xtream = False
-            
-            # 2. טיפול ב-Xtream (ניסיון ליצירה אבל לא נכשלים אם זה לא עובד)
+            # ניסיון חיבור לפאנל - אם נכשל, לא עוצרים!
             if self.iptv_config and self.iptv_config.get('server'):
                 try:
                     c = self.iptv_config
                     clean_server = c['server'].split('/dashboard')[0].rstrip('/')
-                    # בדיקה אם יש פרטים
                     if c['user'] and c['pass']:
-                        has_xtream = True
-                        # ניסיון רישום ב-API (לא קריטי לזרימה)
+                        # כאן אנחנו רק בונים את הלינק, הרישום ל-API נעשה בנפרד או ידנית
+                        xui_target = f"{clean_server}/live/{c['user']}/{c['pass']}/{safe_name}.ts"
+                        
+                        # ניסיון "על הדרך" לרשום את הסטרים, אם נכשל - לא נורא
                         try:
                             auth=f"username={c['user']}&password={c['pass']}"; api=f"{clean_server}/api.php"
-                            requests.post(f"{api}?action=add_stream", data={"username":c['user'],"password":c['pass'],"stream_display_name":self.channel_name,"stream_source":["127.0.0.1"],"category_id":"1","stream_mode":"live"}, verify=False, timeout=3)
+                            requests.post(f"{api}?action=add_stream", data={"username":c['user'],"password":c['pass'],"stream_display_name":self.channel_name,"stream_source":["127.0.0.1"],"category_id":"1","stream_mode":"live"}, verify=False, timeout=2)
                         except: pass
-                        
-                        # בניית הלינק לשידור
-                        xui_target = f"{clean_server}/live/{c['user']}/{c['pass']}/{safe_name}.ts"
                 except: pass
 
-            # 3. בניית פקודת FFmpeg (בדיוק כמו בקוד שעבד לך!)
-            network_flags = ['-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5']
-            
-            # חשוב: שבירת שורות ב-Headers חייבת להיות מדויקת
+            # בניית הפקודה - אם יש XUI משתמשים ב-tee, אחרת רק Local
             ua = HEADERS['User-Agent']
-            cmd = ['ffmpeg', '-y'] + network_flags + ['-headers', f'User-Agent: {ua}\r\n', '-i', self.url, '-c', 'copy']
+            cmd = ['ffmpeg', '-y', '-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-headers', f'User-Agent: {ua}\r\n', '-i', self.url, '-c', 'copy']
 
-            # לוגיקת TEE (פיצול שידור)
-            if has_xtream:
-                # גם הקלטה וגם שידור (עם onfail=ignore כדי שאם השרת נופל ההקלטה תמשיך)
+            if xui_target:
+                # מצב משולב
                 tee_cmd = []
-                if self.record_local:
-                    tee_cmd.append(f"[f=mpegts]'{abs_output}'")
-                
-                # החלק הקריטי: onfail=ignore
-                tee_cmd.append(f"[f=mpegts:onfail=ignore]{xui_target}")
-                
+                if self.record_local: tee_cmd.append(f"[f=mpegts]'{abs_output}'")
+                tee_cmd.append(f"[f=mpegts:onfail=ignore]{xui_target}") # onfail=ignore קריטי!
                 cmd.extend(['-f', 'tee', "|".join(tee_cmd)])
-            else:
+            elif self.record_local:
                 # רק הקלטה
-                if self.record_local:
-                    cmd.extend(['-f', 'mpegts', abs_output])
-                else:
-                    # אם לא מקליטים ולא משדרים - אין מה לעשות, אבל נריץ לריק כדי להראות פעילות
-                    cmd.extend(['-f', 'null', '-'])
+                cmd.extend(['-f', 'mpegts', abs_output])
+            else:
+                # כלום
+                cmd.extend(['-f', 'null', '-'])
 
             try:
-                # הרצה
                 self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 
-                # לולאת בדיקה
                 while self.process.poll() is None and self.is_running:
                     uptime = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time))
+                    disk = "0.0 MB"
+                    if self.record_local and os.path.exists(abs_output):
+                         try: disk = f"{os.path.getsize(abs_output)/1048576:.1f} MB"
+                         except: pass
                     
-                    # בדיקת גודל דיסק קלילה
-                    disk_info = "0.0 MB"
-                    if self.record_local and os.path.exists(channel_path):
-                        try: 
-                             # בדיקה גסה של הקובץ הנוכחי בלבד (מהיר מאוד)
-                             if os.path.exists(abs_output):
-                                 s = os.path.getsize(abs_output) / 1048576
-                                 disk_info = f"{s:.1f} MB"
-                        except: pass
+                    link_status = "Local Only"
+                    if xui_target: link_status = "Pushing to Panel"
                     
-                    self.stats_signal.emit(self.channel_name, {"status":"ACTIVE", "uptime":uptime, "disk":disk_info, "link":xui_target if has_xtream else "Local Only"})
+                    self.stats_signal.emit(self.channel_name, {"status":"ACTIVE", "uptime":uptime, "disk":disk, "link":link_status})
                     time.sleep(2)
                 
                 if self.is_running:
-                    # אם הגענו לפה, FFmpeg קרס
-                    self.log_signal.emit(f"Stream {self.channel_name} dropped. Restarting in 5s...")
-                    time.sleep(5)
+                    self.log_signal.emit(f"⚠️ Stream {self.channel_name} dropped. Restarting...")
+                    time.sleep(2)
+
             except Exception as e:
                 self.log_signal.emit(f"Process Error: {e}")
                 time.sleep(5)
@@ -157,7 +140,7 @@ class RecordingWorker(QThread):
     def stop(self):
         self.is_running = False
         if self.process:
-            try: self.process.terminate(); self.process.wait(timeout=2)
+            try: self.process.terminate(); self.process.wait(timeout=1)
             except: self.process.kill()
         self.wait()
 
@@ -165,10 +148,13 @@ class RecordingWorker(QThread):
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL v22.0 (Stable Core)"); self.resize(1600, 1000)
+        self.setWindowTitle("X-HOTEL v24.0 (Admin Panel)"); self.resize(1600, 1000)
         self.workers={}; self.net_io=psutil.net_io_counters()
         self.setup_ui(); QTimer.singleShot(500, self.restore); self.t=QTimer(); self.t.timeout.connect(self.upd_stats); self.t.start(1000)
-        send_telegram("✅ <b>SYSTEM ONLINE</b>")
+        
+        # הודעת בדיקה בעלייה
+        res = send_telegram("✅ <b>SYSTEM ONLINE</b>", verbose=True)
+        if res != "OK": self.add_log(f"Telegram Init Failed: {res}")
 
     def setup_ui(self):
         self.setStyleSheet("QMainWindow{background:#10121b;} QWidget{color:#e0e6ed;font-family:'Segoe UI';} QTabWidget::pane{border:0;background:#10121b;} QTabBar::tab{background:#1f2233;padding:12px 30px;margin:2px;border-radius:6px;font-weight:bold;} QTabBar::tab:selected{background:#00d4ff;color:black;} QLineEdit{background:#1f2233;border:1px solid #3b3f51;padding:10px;color:white;border-radius:6px;} QTableWidget{background:#151722;border:none;gridline-color:#2d303e;} QHeaderView::section{background:#1f2233;padding:8px;border:none;} QTextEdit{background:#0a0b10;color:#00e676;border-radius:8px;font-family:'Consolas';}")
@@ -178,9 +164,18 @@ class XHotelUI(QMainWindow):
 
         t1=QWidget(); t1l=QVBoxLayout(t1); c_f=QFrame(); gl=QGridLayout(c_f); c_f.setStyleSheet("background:#1f2233;border-radius:12px;padding:10px;")
         self.url=QLineEdit(FIXED_PORTAL); self.usr=QLineEdit("admin"); self.pw=QLineEdit("MazalTovLanu"); self.m3u=QLineEdit(); self.m3u.setPlaceholderText("Paste M3U URL...")
-        gl.addWidget(QLabel("PORTAL"),0,0); gl.addWidget(self.url,0,1); gl.addWidget(QLabel("USER"),0,2); gl.addWidget(self.usr,0,3); gl.addWidget(QLabel("PASS"),0,4); gl.addWidget(self.pw,0,5)
-        gl.addWidget(QLabel("M3U"),1,0); gl.addWidget(self.m3u,1,1,1,4); b=QPushButton("LOAD"); b.setStyleSheet("background:#00d4ff;color:black;font-weight:bold;padding:10px;border-radius:6px;"); b.clicked.connect(self.load_m3u); gl.addWidget(b,1,5)
+        
+        gl.addWidget(QLabel("PORTAL"),0,0); gl.addWidget(self.url,0,1)
+        gl.addWidget(QLabel("USER"),0,2); gl.addWidget(self.usr,0,3)
+        gl.addWidget(QLabel("PASS"),0,4); gl.addWidget(self.pw,0,5)
+        
+        # --- הכפתור החדש ליצירת קטגוריה ---
+        btn_cat = QPushButton("CREATE CATEGORY"); btn_cat.setStyleSheet("background:#9c27b0;color:white;font-weight:bold;padding:10px;"); btn_cat.clicked.connect(self.create_category_manual)
+        gl.addWidget(btn_cat, 1, 0, 1, 1)
+        
+        gl.addWidget(self.m3u,1,1,1,4); b=QPushButton("LOAD M3U"); b.setStyleSheet("background:#00d4ff;color:black;font-weight:bold;padding:10px;border-radius:6px;"); b.clicked.connect(self.load_m3u); gl.addWidget(b,1,5)
         t1l.addWidget(c_f)
+        
         self.tbl=QTableWidget(0,7); self.tbl.setHorizontalHeaderLabels(["SEL","CHANNEL","REC","STATUS","UPTIME","DISK","ACTION"]); self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch); t1l.addWidget(self.tbl)
         acts=QHBoxLayout(); b1=QPushButton("START STREAMING"); b1.setStyleSheet("background:#00e676;color:black;font-weight:bold;padding:15px;"); b1.clicked.connect(self.start_sel); b2=QPushButton("STOP ALL"); b2.setStyleSheet("background:#ff2e63;color:white;font-weight:bold;padding:15px;"); b2.clicked.connect(self.stop_all); acts.addWidget(b1); acts.addWidget(b2); t1l.addLayout(acts); tabs.addTab(t1,"📡 OPERATIONS")
 
@@ -195,16 +190,60 @@ class XHotelUI(QMainWindow):
         btn_restart=ToolButton("RESTART APP","🛑","#00bcd4"); btn_restart.clicked.connect(self.tool_restart_app)
         t3l.addWidget(btn_test,0,0); t3l.addWidget(btn_clean,0,1); t3l.addWidget(btn_reboot,1,0); t3l.addWidget(btn_restart,1,1); t3l.addWidget(QLabel("Tools Area"),2,0,1,2,Qt.AlignmentFlag.AlignCenter); tabs.addTab(t3,"🛠️ TOOLS")
 
-    def tool_test_tg(self): send_telegram("🔔 <b>TEST</b> OK"); QMessageBox.information(self,"TG","Sent.")
+    # --- פונקציית יצירת הקטגוריה הידנית ---
+    def create_category_manual(self):
+        base = self.url.text().split('/dashboard')[0].rstrip('/')
+        api = f"{base}/api.php"
+        auth = f"username={self.usr.text()}&password={self.pw.text()}"
+        
+        self.add_log(f"Trying to connect to Panel: {base}")
+        
+        try:
+            # שלב 1: בדיקת חיבור
+            res = requests.get(f"{api}?action=get_categories&{auth}", timeout=10, verify=False)
+            if res.status_code != 200:
+                QMessageBox.critical(self, "Connection Failed", f"Status Code: {res.status_code}\nResponse: {res.text}")
+                return
+            
+            # שלב 2: בדיקה אם קיים
+            cats = res.json()
+            exists = any(c['category_name'] == "Channels" for c in cats)
+            
+            if exists:
+                QMessageBox.information(self, "Info", "Category 'Channels' already exists!")
+                self.add_log("Category already exists.")
+            else:
+                # שלב 3: יצירה
+                create_res = requests.post(f"{api}?action=add_category", data={
+                    "username": self.usr.text(),
+                    "password": self.pw.text(),
+                    "category_name": "Channels",
+                    "category_type": "live"
+                }, verify=False, timeout=10)
+                
+                if create_res.status_code == 200:
+                    QMessageBox.information(self, "Success", "Category 'Channels' created successfully!")
+                    self.add_log("Category created successfully.")
+                else:
+                    QMessageBox.critical(self, "Error", f"Failed to create category.\n{create_res.text}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Connection Error:\n{str(e)}")
+            self.add_log(f"Category Error: {str(e)}")
+
+    def tool_test_tg(self): 
+        res = send_telegram("🔔 <b>TEST</b> OK", verbose=True)
+        if res == "OK": QMessageBox.information(self,"Success","Message Sent!")
+        else: QMessageBox.critical(self, "Telegram Error", f"Failed to send:\n{res}")
+
     def tool_clean_disk(self): os.system("/root/clean_recordings.sh") if QMessageBox.question(self,'C',"Sure?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes else None
     def tool_reboot(self): os.system("reboot") if QMessageBox.question(self,'R',"Sure?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes else None
     def tool_restart_app(self): QApplication.quit(); os.execl(sys.executable, sys.executable, *sys.argv)
     def add_log(self, m): self.log.append(f"[{datetime.now().strftime('%H:%M')}] {m}")
     def upd_stats(self): self.g_cpu.set_value(psutil.cpu_percent()); self.g_ram.set_value(psutil.virtual_memory().percent); n=psutil.net_io_counters(); self.g_dl.set_value((n.bytes_recv-self.net_io.bytes_recv)/1048576); self.g_ul.set_value((n.bytes_sent-self.net_io.bytes_sent)/1048576); self.net_io=n
     
-    # --- המנוע המשופר (V21) שהצליח לטעון 275 ערוצים ---
     def load_m3u(self):
-        url = self.m3u.text().strip()
+        url = self.m3u.text().strip(); 
         if not url: return
         self.add_log(f"Fetching: {url}")
         
@@ -213,69 +252,65 @@ class XHotelUI(QMainWindow):
             r = requests.get(url, headers=HEADERS, timeout=30, verify=False)
             if r.status_code == 200: data = r.text
         except: pass
-        
-        if not data or len(data) < 10:
-            self.add_log("Standard fetch failed. Engaging CURL...")
+        if not data:
             try: data = subprocess.check_output(['curl', '-k', '-L', url], text=True)
             except: pass
 
         self.tbl.setRowCount(0); self.db = []; name = "Unknown"; count = 0
-        lines = data.split('\n')
-        
-        for line in lines:
+        for line in data.splitlines():
             line = line.strip()
             if not line: continue
-            
             if "#EXTINF" in line:
                 try: name = line.split(',', 1)[1].strip()
                 except: name = "Chan " + str(count)
             elif "://" in line and not line.startswith('#'):
                 r = self.tbl.rowCount(); self.tbl.insertRow(r); self.db.append({"name":name,"url":line})
-                # Checkbox 1: Selection
                 chk=QCheckBox(); cw=QWidget(); cl=QHBoxLayout(cw); cl.addWidget(chk); cl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(r,0,cw)
                 self.tbl.setItem(r,1,QTableWidgetItem(name))
-                # Checkbox 2: Record (Default Checked, but independent)
                 rec=QCheckBox(); rec.setChecked(True); rw=QWidget(); rl=QHBoxLayout(rw); rl.addWidget(rec); rl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(r,2,rw)
-                self.tbl.setItem(r,3,QTableWidgetItem("IDLE")); self.tbl.setItem(r,4,QTableWidgetItem("--")); self.tbl.setItem(r,5,QTableWidgetItem("0 MB"))
+                self.tbl.setItem(r,3,QTableWidgetItem("IDLE")); self.tbl.setItem(r,4,QTableWidgetItem("--")); self.tbl.setItem(r,5,QTableWidgetItem("0 MB")); 
                 b=QPushButton("STOP"); b.setStyleSheet("background:#2d303e;color:#ff2e63;"); b.clicked.connect(lambda _,x=name:self.stop_one(x)); self.tbl.setCellWidget(r,6,b)
                 count += 1; name = "Unknown"
-
         self.add_log(f"Loaded {count} channels.")
 
     def start_sel(self):
         cf={"server":self.url.text(),"user":self.usr.text(),"pass":self.pw.text()}
         for r in range(self.tbl.rowCount()):
-            # בודק אם עמודת SEL מסומנת
             if self.tbl.cellWidget(r,0).layout().itemAt(0).widget().isChecked():
-                n=self.tbl.item(r,1).text()
-                # בודק אם עמודת REC מסומנת (עבור הערוץ הספציפי הזה)
-                rec=self.tbl.cellWidget(r,2).layout().itemAt(0).widget().isChecked()
-                
+                n=self.tbl.item(r,1).text(); rec=self.tbl.cellWidget(r,2).layout().itemAt(0).widget().isChecked()
                 if n not in self.workers: 
                     w=RecordingWorker(n,self.db[r]['url'],cf,rec)
-                    w.stats_signal.connect(self.upd_row); w.log_signal.connect(self.add_log)
+                    w.stats_signal.connect(self.upd_row); w.log_signal.connect(self.add_log); w.finished_signal.connect(self.handle_failure)
                     self.workers[n]=w; w.start()
         self.save()
 
     def upd_row(self,n,s):
         for r in range(self.tbl.rowCount()):
             if self.tbl.item(r,1).text()==n: self.tbl.item(r,3).setText(s['status']); self.tbl.item(r,3).setForeground(QColor("#00e676")); self.tbl.item(r,4).setText(s['uptime']); self.tbl.item(r,5).setText(s['disk'])
+    
+    def handle_failure(self, n):
+        self.stop_one(n) 
+        for r in range(self.tbl.rowCount()):
+            if self.tbl.item(r,1).text()==n: self.tbl.item(r,3).setText("FAILED"); self.tbl.item(r,3).setForeground(QColor("red"))
+
     def stop_one(self,n): 
         if n in self.workers: self.workers[n].stop(); del self.workers[n]
         for r in range(self.tbl.rowCount()):
             if self.tbl.item(r,1).text()==n: self.tbl.item(r,3).setText("STOPPED"); self.tbl.item(r,3).setForeground(QColor("red"))
-    def stop_all(self): [w.stop() for w in self.workers.values()]; self.workers.clear(); self.add_log("Stopped All")
+
+    def stop_all(self): 
+        for w in list(self.workers.values()): w.stop()
+        self.workers.clear(); self.add_log("Stopped All")
+        for r in range(self.tbl.rowCount()): self.tbl.item(r,3).setText("STOPPED"); self.tbl.item(r,3).setForeground(QColor("red"))
+
     def save(self): act=[{"name":n,"rec":w.record_local} for n,w in self.workers.items()]; json.dump({"url":self.url.text(),"user":self.usr.text(),"pass":self.pw.text(),"m3u":self.m3u.text(),"act":act}, open(CONFIG_FILE,"w"))
     def restore(self):
         if os.path.exists(CONFIG_FILE):
             try:
-                s=json.load(open(CONFIG_FILE))
-                u = s.get("url",""); self.url.setText(u if u else FIXED_PORTAL)
+                s=json.load(open(CONFIG_FILE)); u = s.get("url",""); self.url.setText(u if u else FIXED_PORTAL)
                 self.usr.setText(s.get("user","")); self.pw.setText(s.get("pass","")); self.m3u.setText(s.get("m3u",""))
                 if s.get("m3u"): 
-                    self.load_m3u()
-                    act={x['name']:x['rec'] for x in s.get('act',[])}
-                    # שחזור מצב ה-Checkbox בלבד
+                    self.load_m3u(); act={x['name']:x['rec'] for x in s.get('act',[])}
                     for r in range(self.tbl.rowCount()):
                         n = self.tbl.item(r,1).text()
                         if n in act:
