@@ -61,7 +61,8 @@ class StreamWorker(QObject):
         if self.rec: os.makedirs(folder, exist_ok=True)
         xui=self._get_xui(); send_telegram(f"🎬 <b>STARTED:</b> {self.name}")
         while self.running:
-            cmd=['ffmpeg','-y','-rtsp_transport','tcp','-stimeout','5000000','-i',self.url,'-c','copy','-f','mpegts']
+            # שימוש ב-User Agent של VLC גם ב-FFMPEG
+            cmd=['ffmpeg','-y','-user_agent', 'VLC/3.0.18 LibVLC/3.0.18', '-rtsp_transport','tcp','-stimeout','5000000','-i',self.url,'-c','copy','-f','mpegts']
             tgts=[]
             if self.rec: tgts.append(f"[f=mpegts]{os.path.join(folder, datetime.now().strftime('%H%M%S') + '.ts')}")
             if xui: tgts.append(f"[f=mpegts:onfail=ignore]{xui}")
@@ -84,7 +85,7 @@ class StreamWorker(QObject):
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL MANAGER v16.0 (Universal Parser)"); self.resize(1600, 1000)
+        self.setWindowTitle("X-HOTEL MANAGER v17.0 (VLC Spoofer)"); self.resize(1600, 1000)
         self.workers={}; self.net_io=psutil.net_io_counters()
         self.setup_ui(); QTimer.singleShot(500, self.restore); self.t=QTimer(); self.t.timeout.connect(self.upd_stats); self.t.start(1000)
         send_telegram("✅ <b>SYSTEM ONLINE</b>")
@@ -126,59 +127,57 @@ class XHotelUI(QMainWindow):
     def add_log(self, m): self.log.append(f"[{datetime.now().strftime('%H:%M')}] {m}")
     def upd_stats(self): self.g_cpu.set_value(psutil.cpu_percent()); self.g_ram.set_value(psutil.virtual_memory().percent); n=psutil.net_io_counters(); self.g_dl.set_value((n.bytes_recv-self.net_io.bytes_recv)/1048576); self.g_ul.set_value((n.bytes_sent-self.net_io.bytes_sent)/1048576); self.net_io=n
     
-    # --- הפונקציה המתוקנת - פשוטה כמו בעבר ---
+    # --- טעינה כפולה: קודם VLC, אם נכשל אז CURL ---
     def load_m3u(self):
         url = self.m3u.text().strip()
         if not url: return
         self.add_log(f"Fetching: {url}")
         
+        data = ""
         try:
-            # הורדה בסיסית - בלי headers מורכבים שעושים צרות
-            response = requests.get(url, verify=False, timeout=20)
-            data = response.text
-            
-            self.tbl.setRowCount(0); self.db = []
-            
-            # רשימה זמנית לניתוח
-            lines = data.split('\n')
-            name = "Unknown"
-            count = 0
-            
-            for line in lines:
-                line = line.strip()
-                if not line: continue
+            # שלב א: התחזות ל-VLC
+            headers = {
+                'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18',
+                'Accept': '*/*',
+                'Connection': 'keep-alive'
+            }
+            r = requests.get(url, headers=headers, timeout=15, verify=False)
+            if r.status_code == 200 and len(r.text) > 50:
+                data = r.text
+            else:
+                raise Exception("Empty response from Requests")
                 
-                # זיהוי שם
-                if line.startswith("#EXTINF"):
-                    if "," in line:
-                        name = line.split(",")[-1].strip()
-                    else:
-                        name = "Channel"
-                
-                # זיהוי לינק - כל מה שלא מתחיל ב-# ונראה כמו לינק
-                elif not line.startswith("#") and len(line) > 5:
-                    # הוספה לטבלה
-                    r = self.tbl.rowCount(); self.tbl.insertRow(r)
-                    self.db.append({"name": name, "url": line})
-                    
-                    # בניית השורה
-                    chk=QCheckBox(); cw=QWidget(); cl=QHBoxLayout(cw); cl.addWidget(chk); cl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(r,0,cw)
-                    self.tbl.setItem(r,1,QTableWidgetItem(name))
-                    rec=QCheckBox(); rec.setChecked(True); rw=QWidget(); rl=QHBoxLayout(rw); rl.addWidget(rec); rl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(r,2,rw)
-                    self.tbl.setItem(r,3,QTableWidgetItem("IDLE")); self.tbl.setItem(r,4,QTableWidgetItem("--")); self.tbl.setItem(r,5,QTableWidgetItem("0 MB"))
-                    b=QPushButton("STOP"); b.setStyleSheet("background:#2d303e;color:#ff2e63;"); b.clicked.connect(lambda _,x=name:self.stop_one(x)); self.tbl.setCellWidget(r,6,b)
-                    
-                    name = "Unknown" # איפוס
-                    count += 1
-            
-            self.add_log(f"Loaded {count} channels.")
-            if count == 0:
-                QMessageBox.warning(self, "Warning", "0 Channels loaded!\nCheck log for details.")
-                self.add_log("DEBUG: File content start: " + data[:100]) # יראה לנו מה הבעיה אם עדיין יש
-            
-        except Exception as e:
-            self.add_log(f"Error: {str(e)}")
-            QMessageBox.critical(self, "Error", str(e))
+        except:
+            self.add_log("Python requests failed. Trying CURL fallback...")
+            try:
+                # שלב ב: שימוש ב-CURL של השרת
+                data = subprocess.check_output(['curl', '-k', '-L', url], text=True)
+            except Exception as e:
+                self.add_log(f"CURL failed too: {e}")
+                return
+
+        # עיבוד הנתונים
+        self.tbl.setRowCount(0); self.db = []; current_name = "Unknown"
+        count = 0
+        
+        for line in data.splitlines():
+            line = line.strip()
+            if not line: continue
+            if line.startswith("#EXTINF"):
+                if "," in line: current_name = line.split(",", 1)[1].strip()
+                else: current_name = "Chan " + str(count)
+            elif not line.startswith("#") and len(line) > 10:
+                row=self.tbl.rowCount(); self.tbl.insertRow(row); self.db.append({"name":current_name,"url":line})
+                chk=QCheckBox(); cw=QWidget(); cl=QHBoxLayout(cw); cl.addWidget(chk); cl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(row,0,cw)
+                self.tbl.setItem(row,1,QTableWidgetItem(current_name))
+                rec=QCheckBox(); rec.setChecked(True); rw=QWidget(); rl=QHBoxLayout(rw); rl.addWidget(rec); rl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(row,2,rw)
+                self.tbl.setItem(row,3,QTableWidgetItem("IDLE")); self.tbl.setItem(row,4,QTableWidgetItem("--")); self.tbl.setItem(row,5,QTableWidgetItem("0 MB"))
+                b=QPushButton("STOP"); b.setStyleSheet("background:#2d303e;color:#ff2e63;"); b.clicked.connect(lambda _,x=current_name:self.stop_one(x)); self.tbl.setCellWidget(row,6,b)
+                current_name="Unknown"; count+=1
+        
+        self.add_log(f"Loaded {count} channels.")
+        if count == 0:
+            self.add_log("DEBUG CONTENT START: " + data[:200]) # הראה את תחילת הקובץ לדיבוג
 
     def start_sel(self):
         cf={"server":self.url.text(),"user":self.usr.text(),"pass":self.pw.text()}
