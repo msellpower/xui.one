@@ -84,7 +84,7 @@ class StreamWorker(QObject):
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL MANAGER v15.0 (Simple Loader)"); self.resize(1600, 1000)
+        self.setWindowTitle("X-HOTEL MANAGER v16.0 (Universal Parser)"); self.resize(1600, 1000)
         self.workers={}; self.net_io=psutil.net_io_counters()
         self.setup_ui(); QTimer.singleShot(500, self.restore); self.t=QTimer(); self.t.timeout.connect(self.upd_stats); self.t.start(1000)
         send_telegram("✅ <b>SYSTEM ONLINE</b>")
@@ -126,43 +126,58 @@ class XHotelUI(QMainWindow):
     def add_log(self, m): self.log.append(f"[{datetime.now().strftime('%H:%M')}] {m}")
     def upd_stats(self): self.g_cpu.set_value(psutil.cpu_percent()); self.g_ram.set_value(psutil.virtual_memory().percent); n=psutil.net_io_counters(); self.g_dl.set_value((n.bytes_recv-self.net_io.bytes_recv)/1048576); self.g_ul.set_value((n.bytes_sent-self.net_io.bytes_sent)/1048576); self.net_io=n
     
-    # --- התיקון לקריאת M3U ---
+    # --- הפונקציה המתוקנת - פשוטה כמו בעבר ---
     def load_m3u(self):
-        url=self.m3u.text().strip()
+        url = self.m3u.text().strip()
         if not url: return
+        self.add_log(f"Fetching: {url}")
+        
         try:
-            # הורדה פשוטה בלי התחכמויות
-            r = requests.get(url, timeout=15, verify=False)
-            data = r.text
+            # הורדה בסיסית - בלי headers מורכבים שעושים צרות
+            response = requests.get(url, verify=False, timeout=20)
+            data = response.text
             
-            self.tbl.setRowCount(0); self.db=[]; current_name="Unknown"
-            count=0
+            self.tbl.setRowCount(0); self.db = []
             
-            # פרסר פשוט ביותר
-            for line in data.splitlines():
+            # רשימה זמנית לניתוח
+            lines = data.split('\n')
+            name = "Unknown"
+            count = 0
+            
+            for line in lines:
                 line = line.strip()
                 if not line: continue
+                
+                # זיהוי שם
                 if line.startswith("#EXTINF"):
-                    # מנסים לקחת את השם שאחרי הפסיק
-                    if "," in line: current_name = line.split(",", 1)[1].strip()
-                    else: current_name = "Channel " + str(count)
-                elif line.startswith("http") or line.startswith("rtsp") or line.startswith("rtmp"):
-                    # מצאנו לינק - מוסיפים לטבלה
-                    row=self.tbl.rowCount(); self.tbl.insertRow(row); self.db.append({"name":current_name,"url":line})
+                    if "," in line:
+                        name = line.split(",")[-1].strip()
+                    else:
+                        name = "Channel"
+                
+                # זיהוי לינק - כל מה שלא מתחיל ב-# ונראה כמו לינק
+                elif not line.startswith("#") and len(line) > 5:
+                    # הוספה לטבלה
+                    r = self.tbl.rowCount(); self.tbl.insertRow(r)
+                    self.db.append({"name": name, "url": line})
                     
-                    chk=QCheckBox(); cw=QWidget(); cl=QHBoxLayout(cw); cl.addWidget(chk); cl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(row,0,cw)
-                    self.tbl.setItem(row,1,QTableWidgetItem(current_name))
-                    rec=QCheckBox(); rec.setChecked(True); rw=QWidget(); rl=QHBoxLayout(rw); rl.addWidget(rec); rl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(row,2,rw)
-                    self.tbl.setItem(row,3,QTableWidgetItem("IDLE")); self.tbl.setItem(row,4,QTableWidgetItem("--")); self.tbl.setItem(row,5,QTableWidgetItem("0 MB"))
-                    b=QPushButton("STOP"); b.setStyleSheet("background:#2d303e;color:#ff2e63;"); b.clicked.connect(lambda _,x=current_name:self.stop_one(x)); self.tbl.setCellWidget(row,6,b)
+                    # בניית השורה
+                    chk=QCheckBox(); cw=QWidget(); cl=QHBoxLayout(cw); cl.addWidget(chk); cl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(r,0,cw)
+                    self.tbl.setItem(r,1,QTableWidgetItem(name))
+                    rec=QCheckBox(); rec.setChecked(True); rw=QWidget(); rl=QHBoxLayout(rw); rl.addWidget(rec); rl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(r,2,rw)
+                    self.tbl.setItem(r,3,QTableWidgetItem("IDLE")); self.tbl.setItem(r,4,QTableWidgetItem("--")); self.tbl.setItem(r,5,QTableWidgetItem("0 MB"))
+                    b=QPushButton("STOP"); b.setStyleSheet("background:#2d303e;color:#ff2e63;"); b.clicked.connect(lambda _,x=name:self.stop_one(x)); self.tbl.setCellWidget(r,6,b)
                     
-                    count+=1; current_name="Unknown" # איפוס לשם הבא
+                    name = "Unknown" # איפוס
+                    count += 1
             
-            self.add_log(f"Loaded {count} channels successfully")
-            QMessageBox.information(self, "Success", f"Loaded {count} channels!")
+            self.add_log(f"Loaded {count} channels.")
+            if count == 0:
+                QMessageBox.warning(self, "Warning", "0 Channels loaded!\nCheck log for details.")
+                self.add_log("DEBUG: File content start: " + data[:100]) # יראה לנו מה הבעיה אם עדיין יש
             
         except Exception as e:
-            self.add_log(f"Error loading M3U: {e}")
+            self.add_log(f"Error: {str(e)}")
             QMessageBox.critical(self, "Error", str(e))
 
     def start_sel(self):
