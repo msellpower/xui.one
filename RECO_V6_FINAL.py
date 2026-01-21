@@ -1,16 +1,24 @@
-import sys, subprocess, threading, time, os, requests, psutil, json
+import sys, subprocess, time, os, re, requests, psutil, json
 import urllib3
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLineEdit, QPushButton, QTableWidget,
                              QTableWidgetItem, QHeaderView, QLabel, QCheckBox, 
                              QFrame, QMessageBox, QGridLayout, QTabWidget, QTextEdit)
-from PyQt6.QtCore import pyqtSignal, QObject, Qt, QTimer, QRectF
+from PyQt6.QtCore import pyqtSignal, QObject, Qt, QTimer, QRectF, QThread
 from PyQt6.QtGui import QPainter, QColor, QPen, QFont
 
 # --- הגדרות ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["QT_QUICK_BACKEND"] = "software"
+
+# Headers לעקיפת חסימות (הוכח כעובד)
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Connection': 'keep-alive'
+}
+
 TELEGRAM_TOKEN = "8307008722:AAHY-QYNYyTnOwjS0q4VGfA0_iUiQBxYHBc"
 TELEGRAM_CHAT_ID = "-5125327073"
 CONFIG_FILE = "/root/iptv_config.json"
@@ -41,51 +49,116 @@ class ProGauge(QWidget):
         p.setPen(QColor("white")); p.setFont(QFont("Segoe UI",22,QFont.Weight.Bold)); p.drawText(rect,Qt.AlignmentFlag.AlignCenter,f"{self.value:.1f}{self.unit}")
         p.setPen(QColor("#a6accd")); p.setFont(QFont("Segoe UI",10)); p.drawText(int(w/2)-50,int(h)-30,100,20,Qt.AlignmentFlag.AlignCenter,self.title)
 
-# --- לוגיקת שידור ---
-class StreamWorker(QObject):
+# --- המנוע (QThread Implementation) ---
+# שיפור 1: שימוש ב-QThread במקום Thread רגיל למניעת קריסות GUI
+class RecordingWorker(QThread):
     stats_signal = pyqtSignal(str, dict)
-    def __init__(self, name, url, config, record): super().__init__(); self.name=name; self.url=url; self.config=config; self.rec=record; self.running=True; self.proc=None
-    def _get_xui(self):
-        try:
-            c=self.config; base=c['server'].split('/dashboard')[0].rstrip('/'); api=f"{base}/api.php"; auth=f"username={c['user']}&password={c['pass']}"
-            try: res=requests.get(f"{api}?action=get_categories&{auth}", timeout=5, verify=False).json(); cat=next((x['category_id'] for x in res if x['category_name']=="Channels"), None)
-            except: cat=None
-            if not cat: 
-                try: cat=requests.post(f"{api}?action=add_category", data={**c,"category_name":"Channels","category_type":"live"}, verify=False).json().get('category_id',"1")
-                except: cat="1"
-            requests.post(f"{api}?action=add_stream", data={"username":c['user'],"password":c['pass'],"stream_display_name":self.name,"stream_source":["127.0.0.1"],"category_id":cat,"stream_mode":"live"}, verify=False)
-            return f"{base}/live/{c['user']}/{c['pass']}/{self.name.replace(' ','_')}.ts"
-        except: return None
-    def run(self):
-        start=time.time(); folder=os.path.join(RECORDINGS_PATH, self.name.replace(" ","_")); 
-        if self.rec: os.makedirs(folder, exist_ok=True)
-        xui=self._get_xui(); send_telegram(f"🎬 <b>STARTED:</b> {self.name}")
-        while self.running:
-            # שימוש ב-User Agent של VLC גם ב-FFMPEG
-            cmd=['ffmpeg','-y','-user_agent', 'VLC/3.0.18 LibVLC/3.0.18', '-rtsp_transport','tcp','-stimeout','5000000','-i',self.url,'-c','copy','-f','mpegts']
-            tgts=[]
-            if self.rec: tgts.append(f"[f=mpegts]{os.path.join(folder, datetime.now().strftime('%H%M%S') + '.ts')}")
-            if xui: tgts.append(f"[f=mpegts:onfail=ignore]{xui}")
-            if tgts: cmd.extend(['-f','tee',"|".join(tgts)])
-            else: cmd.extend(['-f','null','-'])
-            try:
-                self.proc=subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                while self.proc.poll() is None and self.running:
-                    uptime=time.strftime("%H:%M:%S", time.gmtime(time.time()-start)); d_size=0
-                    if self.rec and os.path.exists(folder):
-                        try: d_size=sum(os.path.getsize(os.path.join(folder,f)) for f in os.listdir(folder))/1048576
-                        except: pass
-                    self.stats_signal.emit(self.name, {"status":"ACTIVE","uptime":uptime,"disk":f"{d_size:.1f} MB","link":xui or "N/A"})
-                    time.sleep(3)
-                if self.running: time.sleep(5)
-            except: time.sleep(10)
-    def stop(self): self.running=False; self.proc.terminate() if self.proc else None
+    log_signal = pyqtSignal(str) # לוגים לממשק
 
-# --- ממשק ---
+    def __init__(self, name, url, config, record_local):
+        super().__init__()
+        self.channel_name = name
+        self.url = url
+        self.iptv_config = config
+        self.record_local = record_local
+        self.is_running = True
+        self.process = None
+
+    def run(self):
+        # יצירת נתיב
+        safe_name = re.sub(r'[\\/*?:"<>|]', "", self.channel_name).strip().replace(" ", "_")
+        channel_path = os.path.join(RECORDINGS_PATH, safe_name)
+        if self.record_local:
+            os.makedirs(channel_path, exist_ok=True)
+
+        send_telegram(f"🎬 <b>STARTED:</b> {self.channel_name}")
+        start_time = time.time()
+        
+        # שיפור 4: אופטימיזציה לחישוב דיסק (לא בכל איטרציה)
+        disk_check_counter = 0
+        cached_disk_size = "0.0 MB"
+
+        while self.is_running:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = os.path.join(channel_path, f"{safe_name}_{timestamp}.ts")
+            
+            # בדיקת XUI + שיפור 2: טיפול בשגיאות
+            xui_link = "N/A"
+            if self.iptv_config and self.iptv_config.get('server'):
+                try:
+                    c = self.iptv_config
+                    clean_server = c['server'].split('/dashboard')[0].rstrip('/')
+                    auth=f"username={c['user']}&password={c['pass']}"; api=f"{clean_server}/api.php"
+                    
+                    # ניסיון יצירה עם Timeout וטיפול בשגיאות
+                    try: 
+                        res = requests.get(f"{api}?action=get_categories&{auth}", timeout=5, verify=False)
+                        res.raise_for_status() # זורק שגיאה אם הסטטוס לא 200
+                        cat_data = res.json()
+                        cat = next((x['category_id'] for x in cat_data if x['category_name']=="Channels"), "1")
+                    except: cat="1"
+                    
+                    requests.post(f"{api}?action=add_stream", data={"username":c['user'],"password":c['pass'],"stream_display_name":self.channel_name,"stream_source":["127.0.0.1"],"category_id":cat,"stream_mode":"live"}, verify=False, timeout=5)
+                    xui_link = f"{clean_server}/live/{c['user']}/{c['pass']}/{safe_name}.ts"
+                except Exception as e:
+                    self.log_signal.emit(f"API Error ({self.channel_name}): {str(e)}")
+
+            # פקודת FFmpeg (מהגרסה שעבדה)
+            network_flags = ['-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5']
+            cmd = ['ffmpeg', '-y'] + network_flags + ['-headers', f'User-Agent: {HEADERS["User-Agent"]}\r\n', '-i', self.url, '-c', 'copy']
+
+            outputs = []
+            if self.record_local: outputs.append(f"[f=mpegts]'{output_file}'")
+            if xui_link != "N/A": outputs.append(f"[f=mpegts:onfail=ignore]{xui_link}")
+
+            if outputs: cmd.extend(['-f', 'tee', "|".join(outputs)])
+            else: cmd.extend(['-f', 'null', '-'])
+
+            try:
+                self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                
+                while self.process.poll() is None and self.is_running:
+                    uptime = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time))
+                    
+                    # שיפור 4: בדיקת דיסק רק פעם ב-10 שניות (כל 5 איטרציות של 2 שניות)
+                    disk_check_counter += 1
+                    if self.record_local and disk_check_counter >= 5:
+                        disk_check_counter = 0
+                        try: 
+                            # בדיקה מהירה יותר באמצעות stat
+                            total = sum(entry.stat().st_size for entry in os.scandir(channel_path) if entry.is_file())
+                            cached_disk_size = f"{total/1048576:.1f} MB"
+                        except: pass
+                    
+                    self.stats_signal.emit(self.channel_name, {"status":"ACTIVE", "uptime":uptime, "disk":cached_disk_size, "link":xui_link})
+                    time.sleep(2)
+                
+                if self.is_running: 
+                    self.log_signal.emit(f"Stream {self.channel_name} dropped. Restarting...")
+                    time.sleep(2)
+            except Exception as e:
+                self.log_signal.emit(f"FFmpeg Error: {str(e)}")
+                time.sleep(5)
+
+    # שיפור 3: סגירה מסודרת (Graceful Exit)
+    def stop(self):
+        self.is_running = False
+        if self.process:
+            try:
+                self.process.terminate() # בקשה מנומסת לסגירה
+                try:
+                    self.process.wait(timeout=2) # המתנה של 2 שניות
+                except subprocess.TimeoutExpired:
+                    self.process.kill() # הרג בכוח רק אם נתקע
+            except:
+                pass
+        self.wait() # המתנה לסיום ה-Thread של Qt
+
+# --- ממשק משתמש ---
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL MANAGER v17.0 (VLC Spoofer)"); self.resize(1600, 1000)
+        self.setWindowTitle("X-HOTEL v19.0 (Architect Edition)"); self.resize(1600, 1000)
         self.workers={}; self.net_io=psutil.net_io_counters()
         self.setup_ui(); QTimer.singleShot(500, self.restore); self.t=QTimer(); self.t.timeout.connect(self.upd_stats); self.t.start(1000)
         send_telegram("✅ <b>SYSTEM ONLINE</b>")
@@ -119,7 +192,6 @@ class XHotelUI(QMainWindow):
         btn_restart=ToolButton("RESTART APP","🛑","#00bcd4"); btn_restart.clicked.connect(self.tool_restart_app)
         t3l.addWidget(btn_test,0,0); t3l.addWidget(btn_clean,0,1); t3l.addWidget(btn_reboot,1,0); t3l.addWidget(btn_restart,1,1); t3l.addWidget(QLabel("Tools"),2,0,1,2,Qt.AlignmentFlag.AlignCenter); tabs.addTab(t3,"🛠️ TOOLS")
 
-    # --- פונקציות ---
     def tool_test_tg(self): send_telegram("🔔 <b>TEST</b> OK"); QMessageBox.information(self,"TG","Sent.")
     def tool_clean_disk(self): os.system("/root/clean_recordings.sh") if QMessageBox.question(self,'C',"Sure?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes else None
     def tool_reboot(self): os.system("reboot") if QMessageBox.question(self,'R',"Sure?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes else None
@@ -127,65 +199,38 @@ class XHotelUI(QMainWindow):
     def add_log(self, m): self.log.append(f"[{datetime.now().strftime('%H:%M')}] {m}")
     def upd_stats(self): self.g_cpu.set_value(psutil.cpu_percent()); self.g_ram.set_value(psutil.virtual_memory().percent); n=psutil.net_io_counters(); self.g_dl.set_value((n.bytes_recv-self.net_io.bytes_recv)/1048576); self.g_ul.set_value((n.bytes_sent-self.net_io.bytes_sent)/1048576); self.net_io=n
     
-    # --- טעינה כפולה: קודם VLC, אם נכשל אז CURL ---
     def load_m3u(self):
-        url = self.m3u.text().strip()
+        url = self.m3u.text().strip(); 
         if not url: return
-        self.add_log(f"Fetching: {url}")
-        
-        data = ""
         try:
-            # שלב א: התחזות ל-VLC
-            headers = {
-                'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18',
-                'Accept': '*/*',
-                'Connection': 'keep-alive'
-            }
-            r = requests.get(url, headers=headers, timeout=15, verify=False)
-            if r.status_code == 200 and len(r.text) > 50:
-                data = r.text
-            else:
-                raise Exception("Empty response from Requests")
-                
-        except:
-            self.add_log("Python requests failed. Trying CURL fallback...")
-            try:
-                # שלב ב: שימוש ב-CURL של השרת
-                data = subprocess.check_output(['curl', '-k', '-L', url], text=True)
-            except Exception as e:
-                self.add_log(f"CURL failed too: {e}")
-                return
-
-        # עיבוד הנתונים
-        self.tbl.setRowCount(0); self.db = []; current_name = "Unknown"
-        count = 0
-        
-        for line in data.splitlines():
-            line = line.strip()
-            if not line: continue
-            if line.startswith("#EXTINF"):
-                if "," in line: current_name = line.split(",", 1)[1].strip()
-                else: current_name = "Chan " + str(count)
-            elif not line.startswith("#") and len(line) > 10:
-                row=self.tbl.rowCount(); self.tbl.insertRow(row); self.db.append({"name":current_name,"url":line})
-                chk=QCheckBox(); cw=QWidget(); cl=QHBoxLayout(cw); cl.addWidget(chk); cl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(row,0,cw)
-                self.tbl.setItem(row,1,QTableWidgetItem(current_name))
-                rec=QCheckBox(); rec.setChecked(True); rw=QWidget(); rl=QHBoxLayout(rw); rl.addWidget(rec); rl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(row,2,rw)
-                self.tbl.setItem(row,3,QTableWidgetItem("IDLE")); self.tbl.setItem(row,4,QTableWidgetItem("--")); self.tbl.setItem(row,5,QTableWidgetItem("0 MB"))
-                b=QPushButton("STOP"); b.setStyleSheet("background:#2d303e;color:#ff2e63;"); b.clicked.connect(lambda _,x=current_name:self.stop_one(x)); self.tbl.setCellWidget(row,6,b)
-                current_name="Unknown"; count+=1
-        
-        self.add_log(f"Loaded {count} channels.")
-        if count == 0:
-            self.add_log("DEBUG CONTENT START: " + data[:200]) # הראה את תחילת הקובץ לדיבוג
+            res = requests.get(url, headers=HEADERS, timeout=30, verify=False)
+            self.tbl.setRowCount(0); self.db = []; name = "Unknown"
+            for line in res.text.splitlines():
+                line = line.strip()
+                if line.startswith("#EXTINF"): m = re.search(r',([^,]+)$', line); name = m.group(1).strip() if m else "Unknown"
+                elif line.startswith("http"):
+                    r = self.tbl.rowCount(); self.tbl.insertRow(r); self.db.append({"name":name,"url":line})
+                    chk=QCheckBox(); cw=QWidget(); cl=QHBoxLayout(cw); cl.addWidget(chk); cl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(r,0,cw)
+                    self.tbl.setItem(r,1,QTableWidgetItem(name))
+                    rec=QCheckBox(); rec.setChecked(True); rw=QWidget(); rl=QHBoxLayout(rw); rl.addWidget(rec); rl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.tbl.setCellWidget(r,2,rw)
+                    self.tbl.setItem(r,3,QTableWidgetItem("IDLE")); self.tbl.setItem(r,4,QTableWidgetItem("--")); self.tbl.setItem(r,5,QTableWidgetItem("0 MB"))
+                    b=QPushButton("STOP"); b.setStyleSheet("background:#2d303e;color:#ff2e63;"); b.clicked.connect(lambda _,x=name:self.stop_one(x)); self.tbl.setCellWidget(r,6,b)
+            self.add_log(f"Loaded {len(self.db)} channels")
+        except Exception as e: self.add_log(f"Error: {e}")
 
     def start_sel(self):
         cf={"server":self.url.text(),"user":self.usr.text(),"pass":self.pw.text()}
         for r in range(self.tbl.rowCount()):
             if self.tbl.cellWidget(r,0).layout().itemAt(0).widget().isChecked():
                 n=self.tbl.item(r,1).text(); rec=self.tbl.cellWidget(r,2).layout().itemAt(0).widget().isChecked()
-                if n not in self.workers: w=StreamWorker(n,self.db[r]['url'],cf,rec); w.stats_signal.connect(self.upd_row); self.workers[n]=w; threading.Thread(target=w.run, daemon=True).start()
+                if n not in self.workers: 
+                    w=RecordingWorker(n,self.db[r]['url'],cf,rec)
+                    w.stats_signal.connect(self.upd_row)
+                    w.log_signal.connect(self.add_log)
+                    self.workers[n]=w
+                    w.start() # Start the QThread
         self.save()
+
     def upd_row(self,n,s):
         for r in range(self.tbl.rowCount()):
             if self.tbl.item(r,1).text()==n: self.tbl.item(r,3).setText(s['status']); self.tbl.item(r,3).setForeground(QColor("#00e676")); self.tbl.item(r,4).setText(s['uptime']); self.tbl.item(r,5).setText(s['disk'])
@@ -194,7 +239,7 @@ class XHotelUI(QMainWindow):
         for r in range(self.tbl.rowCount()):
             if self.tbl.item(r,1).text()==n: self.tbl.item(r,3).setText("STOPPED"); self.tbl.item(r,3).setForeground(QColor("red"))
     def stop_all(self): [w.stop() for w in self.workers.values()]; self.workers.clear(); self.add_log("Stopped All")
-    def save(self): act=[{"name":n,"rec":w.rec} for n,w in self.workers.items()]; json.dump({"url":self.url.text(),"user":self.usr.text(),"pass":self.pw.text(),"m3u":self.m3u.text(),"act":act}, open(CONFIG_FILE,"w"))
+    def save(self): act=[{"name":n,"rec":w.record_local} for n,w in self.workers.items()]; json.dump({"url":self.url.text(),"user":self.usr.text(),"pass":self.pw.text(),"m3u":self.m3u.text(),"act":act}, open(CONFIG_FILE,"w"))
     def restore(self):
         if os.path.exists(CONFIG_FILE):
             try:
