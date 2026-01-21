@@ -12,12 +12,21 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QFont
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["QT_QUICK_BACKEND"] = "software"
 
-# התחזות לדפדפן מה-CURL שלך
-HEADERS = {
+# --- הפרדת רשויות: ראשים שונים למטרות שונות ---
+
+# 1. ראשים לפאנל (התחזות לדפדפן כדי לעבור חסימות)
+API_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/javascript, */*; q=0.01',
-    'Connection': 'keep-alive',
-    'X-Requested-With': 'XMLHttpRequest'
+    'X-Requested-With': 'XMLHttpRequest',
+    'Connection': 'keep-alive'
+}
+
+# 2. ראשים לשידור ול-M3U (התחזות לנגן כדי לקבל וידאו)
+STREAM_HEADERS = {
+    'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18',
+    'Accept': '*/*',
+    'Connection': 'keep-alive'
 }
 
 TELEGRAM_TOKEN = "8307008722:AAHY-QYNYyTnOwjS0q4VGfA0_iUiQBxYHBc"
@@ -88,16 +97,17 @@ class RecordingWorker(QThread):
                     if c['user'] and c['pass']:
                         xui_target = f"{base_url}/live/{c['user']}/{c['pass']}/{safe_name}.ts"
                         try:
-                            # שימוש ב-add_stream ל-API
+                            # שימוש ב-API HEADERS (דפדפן) לרישום בפאנל
                             requests.post(f"{api_endpoint}?action=add_stream", data={
                                 "username":c['user'], "password":c['pass'],
                                 "stream_display_name":self.channel_name, "stream_source":["127.0.0.1"],
                                 "category_id":c.get('cat_id', '1'), "stream_mode":"live"
-                            }, headers=HEADERS, verify=False, timeout=5)
+                            }, headers=API_HEADERS, verify=False, timeout=5)
                         except: pass
                 except: pass
 
-            ua = HEADERS['User-Agent']
+            # שימוש ב-STREAM HEADERS (VLC) למשיכת הוידאו
+            ua = STREAM_HEADERS['User-Agent']
             cmd = ['ffmpeg', '-y', '-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-headers', f'User-Agent: {ua}\r\n', '-i', self.url, '-c', 'copy']
 
             if xui_target:
@@ -143,7 +153,7 @@ class RecordingWorker(QThread):
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL v30.0 (The Mirror)"); self.resize(1600, 1000)
+        self.setWindowTitle("X-HOTEL v31.0 (The Hybrid)"); self.resize(1600, 1000)
         self.workers={}; self.net_io=psutil.net_io_counters()
         self.setup_ui(); QTimer.singleShot(500, self.restore); self.t=QTimer(); self.t.timeout.connect(self.upd_stats); self.t.start(1000)
         
@@ -200,19 +210,15 @@ class XHotelUI(QMainWindow):
         self.add_log(f"Testing: {url}...")
         
         try:
-            # שיניתי ל-action=stats בדיוק כמו ב-CURL שלך
-            res = requests.get(f"{url}?action=stats&{auth}", headers=HEADERS, timeout=8, verify=False)
+            # שימוש ב-API HEADERS (Chrome)
+            res = requests.get(f"{url}?action=stats&{auth}", headers=API_HEADERS, timeout=8, verify=False)
             
-            # הדפסת התגובה הגולמית ללוג למקרה הצורך
-            self.add_log(f"Raw Response: {repr(res.text[:200])}")
-
             if res.status_code == 200:
-                # בדיקה רכה יותר
                 if "server_name" in res.text or "total_users" in res.text or res.text.strip().startswith("{"):
-                    QMessageBox.information(self, "Success", "Connection Established!\n(Using 'stats' action)")
+                    QMessageBox.information(self, "Success", "Connection Established!")
                     self.add_log("API Connection Success.")
                 else:
-                     QMessageBox.warning(self, "Check", "Got 200 OK, but response is empty or unexpected.\nCheck 'Raw Response' in logs.")
+                     QMessageBox.warning(self, "Check", "Got 200 OK, but response looks empty.")
             else:
                 QMessageBox.critical(self, "Error", f"Failed. Status: {res.status_code}")
         except Exception as e:
@@ -221,7 +227,7 @@ class XHotelUI(QMainWindow):
     def tool_test_tg(self): 
         res = send_telegram("🔔 <b>TEST</b> OK", verbose=True)
         if res == "OK": QMessageBox.information(self,"Success","Message Sent!")
-        else: QMessageBox.critical(self, "Telegram Error", f"Failed:\n{res}\nCheck if Bot is Admin in Group.")
+        else: QMessageBox.critical(self, "Telegram Error", f"Failed:\n{res}")
 
     def tool_clean_disk(self): os.system("/root/clean_recordings.sh") if QMessageBox.question(self,'C',"Sure?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes else None
     def tool_reboot(self): os.system("reboot") if QMessageBox.question(self,'R',"Sure?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes else None
@@ -235,12 +241,15 @@ class XHotelUI(QMainWindow):
         self.add_log(f"Fetching: {url}")
         
         data = ""
+        # 1. ניסיון ראשי: requests עם STREAM_HEADERS (VLC)
         try:
-            # שימוש ב-HEADERS המעודכנים (Chrome)
-            r = requests.get(url, headers=HEADERS, timeout=30, verify=False)
+            r = requests.get(url, headers=STREAM_HEADERS, timeout=30, verify=False)
             if r.status_code == 200: data = r.text
         except: pass
-        if not data:
+        
+        # 2. ניסיון משני: CURL עם גיבוי
+        if not data or len(data) < 50:
+            self.add_log("Requests failed. Using CURL...")
             try: data = subprocess.check_output(['curl', '-k', '-L', url], text=True)
             except: pass
 
