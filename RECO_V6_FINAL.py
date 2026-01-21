@@ -12,10 +12,12 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QFont
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["QT_QUICK_BACKEND"] = "software"
 
+# התחזות לדפדפן מה-CURL שלך
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    'Accept': '*/*',
-    'Connection': 'keep-alive'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'Connection': 'keep-alive',
+    'X-Requested-With': 'XMLHttpRequest'
 }
 
 TELEGRAM_TOKEN = "8307008722:AAHY-QYNYyTnOwjS0q4VGfA0_iUiQBxYHBc"
@@ -80,23 +82,18 @@ class RecordingWorker(QThread):
             c = self.iptv_config
             if c.get('ip') and c.get('port') and c.get('api_path'):
                 try:
-                    # שימוש בנתיב המותאם אישית
                     base_url = f"http://{c['ip']}:{c['port']}"
-                    # חשוב: כאן אנחנו משתמשים בנתיב החדש
                     api_endpoint = f"{base_url}{c['api_path']}"
                     
                     if c['user'] and c['pass']:
                         xui_target = f"{base_url}/live/{c['user']}/{c['pass']}/{safe_name}.ts"
                         try:
-                            # רישום ל-API בנתיב הנכון
+                            # שימוש ב-add_stream ל-API
                             requests.post(f"{api_endpoint}?action=add_stream", data={
-                                "username":c['user'],
-                                "password":c['pass'],
-                                "stream_display_name":self.channel_name,
-                                "stream_source":["127.0.0.1"],
-                                "category_id":c.get('cat_id', '1'),
-                                "stream_mode":"live"
-                            }, verify=False, timeout=5)
+                                "username":c['user'], "password":c['pass'],
+                                "stream_display_name":self.channel_name, "stream_source":["127.0.0.1"],
+                                "category_id":c.get('cat_id', '1'), "stream_mode":"live"
+                            }, headers=HEADERS, verify=False, timeout=5)
                         except: pass
                 except: pass
 
@@ -146,7 +143,7 @@ class RecordingWorker(QThread):
 class XHotelUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("X-HOTEL v29.0 (Custom Path)"); self.resize(1600, 1000)
+        self.setWindowTitle("X-HOTEL v30.0 (The Mirror)"); self.resize(1600, 1000)
         self.workers={}; self.net_io=psutil.net_io_counters()
         self.setup_ui(); QTimer.singleShot(500, self.restore); self.t=QTimer(); self.t.timeout.connect(self.upd_stats); self.t.start(1000)
         
@@ -161,9 +158,8 @@ class XHotelUI(QMainWindow):
 
         t1=QWidget(); t1l=QVBoxLayout(t1); c_f=QFrame(); gl=QGridLayout(c_f); c_f.setStyleSheet("background:#1f2233;border-radius:12px;padding:10px;")
         
-        # --- שדות חדשים כולל API PATH ---
         self.ip=QLineEdit(DEFAULT_IP); self.port=QLineEdit("80"); self.port.setPlaceholderText("Port")
-        self.api_path=QLineEdit("/mbmWePBa/api"); self.api_path.setPlaceholderText("API Path (e.g. /api.php)")
+        self.api_path=QLineEdit("/mbmWePBa/api"); self.api_path.setPlaceholderText("API Path")
         
         self.usr=QLineEdit("admin"); self.pw=QLineEdit("MazalTovLanu")
         self.cat_id=QSpinBox(); self.cat_id.setValue(1); self.cat_id.setPrefix("Cat ID: ")
@@ -178,7 +174,6 @@ class XHotelUI(QMainWindow):
         gl.addWidget(QLabel("PASS"),1,2); gl.addWidget(self.pw,1,3)
         gl.addWidget(QLabel("CATEGORY ID"),1,4); gl.addWidget(self.cat_id,1,5)
         
-        # כפתור בדיקה
         btn_check = QPushButton("CHECK CONNECTION"); btn_check.setStyleSheet("background:#e91e63;color:white;font-weight:bold;padding:10px;"); btn_check.clicked.connect(self.check_connection)
         gl.addWidget(btn_check, 2, 4, 1, 2)
         
@@ -200,26 +195,24 @@ class XHotelUI(QMainWindow):
         t3l.addWidget(btn_test,0,0); t3l.addWidget(btn_clean,0,1); t3l.addWidget(btn_reboot,1,0); t3l.addWidget(btn_restart,1,1); t3l.addWidget(QLabel("Tools Area"),2,0,1,2,Qt.AlignmentFlag.AlignCenter); tabs.addTab(t3,"🛠️ TOOLS")
 
     def check_connection(self):
-        # בניית הכתובת לפי הפורמט החדש
         url = f"http://{self.ip.text()}:{self.port.text()}{self.api_path.text()}"
         auth = f"username={self.usr.text()}&password={self.pw.text()}"
         self.add_log(f"Testing: {url}...")
         
         try:
-            res = requests.get(f"{url}?action=get_categories&{auth}", timeout=8, verify=False)
+            # שיניתי ל-action=stats בדיוק כמו ב-CURL שלך
+            res = requests.get(f"{url}?action=stats&{auth}", headers=HEADERS, timeout=8, verify=False)
             
+            # הדפסת התגובה הגולמית ללוג למקרה הצורך
+            self.add_log(f"Raw Response: {repr(res.text[:200])}")
+
             if res.status_code == 200:
-                # בדיקה אם קיבלנו JSON
-                try:
-                    data = res.json()
-                    QMessageBox.information(self, "Success", "Connection & API Verified!")
-                    self.add_log("API OK: JSON Response received.")
-                except:
-                    # אם זה לא JSON, אולי זה עדיין יעבוד בגלל המבנה
-                    self.add_log(f"Response: {res.text[:100]}")
-                    QMessageBox.warning(self, "Check", "Got 200 OK, but response wasn't clean JSON.\nCheck logs.")
-            elif res.status_code == 404:
-                QMessageBox.critical(self, "Error", "404 Not Found.\nThe API Path is incorrect.")
+                # בדיקה רכה יותר
+                if "server_name" in res.text or "total_users" in res.text or res.text.strip().startswith("{"):
+                    QMessageBox.information(self, "Success", "Connection Established!\n(Using 'stats' action)")
+                    self.add_log("API Connection Success.")
+                else:
+                     QMessageBox.warning(self, "Check", "Got 200 OK, but response is empty or unexpected.\nCheck 'Raw Response' in logs.")
             else:
                 QMessageBox.critical(self, "Error", f"Failed. Status: {res.status_code}")
         except Exception as e:
@@ -228,7 +221,7 @@ class XHotelUI(QMainWindow):
     def tool_test_tg(self): 
         res = send_telegram("🔔 <b>TEST</b> OK", verbose=True)
         if res == "OK": QMessageBox.information(self,"Success","Message Sent!")
-        else: QMessageBox.critical(self, "Telegram Error", f"Failed:\n{res}")
+        else: QMessageBox.critical(self, "Telegram Error", f"Failed:\n{res}\nCheck if Bot is Admin in Group.")
 
     def tool_clean_disk(self): os.system("/root/clean_recordings.sh") if QMessageBox.question(self,'C',"Sure?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes else None
     def tool_reboot(self): os.system("reboot") if QMessageBox.question(self,'R',"Sure?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes else None
@@ -243,6 +236,7 @@ class XHotelUI(QMainWindow):
         
         data = ""
         try:
+            # שימוש ב-HEADERS המעודכנים (Chrome)
             r = requests.get(url, headers=HEADERS, timeout=30, verify=False)
             if r.status_code == 200: data = r.text
         except: pass
@@ -269,12 +263,8 @@ class XHotelUI(QMainWindow):
 
     def start_sel(self):
         cf={
-            "ip":self.ip.text(),
-            "port":self.port.text(),
-            "api_path":self.api_path.text(),
-            "user":self.usr.text(),
-            "pass":self.pw.text(),
-            "cat_id":str(self.cat_id.value())
+            "ip":self.ip.text(), "port":self.port.text(), "api_path":self.api_path.text(),
+            "user":self.usr.text(), "pass":self.pw.text(), "cat_id":str(self.cat_id.value())
         }
         for r in range(self.tbl.rowCount()):
             if self.tbl.cellWidget(r,0).layout().itemAt(0).widget().isChecked():
