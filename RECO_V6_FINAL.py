@@ -11,10 +11,6 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QFont
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["QT_QUICK_BACKEND"] = "software"
 
-CONFIG_FILE = "/root/iptv_config.json"
-RECORDINGS_PATH = "/root/Recordings"
-TELEGRAM_TOKEN = "8307008722:AAHY-QYNYyTnOwjS0q4VGfA0_iUiQBxYHBc"
-TELEGRAM_CHAT_ID = "-1003477621724"
 
 def send_telegram(msg):
     try:
